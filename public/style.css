@@ -68,3 +68,57 @@ body {
         color: rgba(255, 255, 255, 0.3);
     }
 }
+.net {
+    margin: 16px 0;
+    padding: 12px 12px 4px;
+    border: 1px solid rgba(46, 230, 255, 0.35);
+    border-radius: 4px;
+}
+
+.net h2 {
+    margin: 0 0 8px;
+    font-size: 0.95em;
+    letter-spacing: 1px;
+    color: #2ee6ff;
+}
+
+.net .button {
+    width: 100%;
+    margin: 6px 0;
+}
+
+.net-status {
+    margin: 4px 0;
+}
+
+.net-code {
+    margin: 6px 0;
+    font-family: 'Courier New', monospace;
+    font-size: 1.5em;
+    letter-spacing: 4px;
+    color: #ffd166;
+}
+
+.net-join {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.net-input {
+    width: 100%;
+    padding: 9px;
+    background-color: #000000;
+    color: #ffd166;
+    border: 1px solid rgba(255, 255, 255, 0.5);
+    font-family: 'Courier New', monospace;
+    font-size: 1em;
+    letter-spacing: 3px;
+    text-align: center;
+    text-transform: uppercase;
+}
+
+.net-error {
+    margin: 6px 0;
+    color: #ff6b78;
+}

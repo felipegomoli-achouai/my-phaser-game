@@ -3,6 +3,7 @@ import { EventBus } from '../EventBus';
 import { Bey } from '../Bey';
 import { sfx } from '../Sfx';
 import { music } from '../Music';
+import { net, type NetMessage, type NetRole } from '../Net';
 
 const ARENA_X = 512;
 const ARENA_Y = 384;
@@ -53,6 +54,14 @@ const SPECIAL_TUMBLE_TIME = 1.2;
 const RAIL_LAUNCH_SPEED = 950;
 const RAIL_TUMBLE_TIME = 0.6;
 
+/** Online play: how often the host ships state and the guest ships input. */
+const NET_SNAPSHOT_HZ = 30;
+const NET_INPUT_HZ = 30;
+/** Past this much disagreement the guest stops easing and just teleports. */
+const NET_SNAP_DISTANCE = 120;
+/** How long the guest tolerates being in a different phase before resyncing. */
+const NET_PHASE_GRACE = 1.5;
+
 /** Debug: player starts with the special meter already full. */
 const DEBUG_FULL_METER = true;
 
@@ -78,6 +87,8 @@ export class Game extends Scene
     private centerText: GameObjects.Text;
     private specialText: GameObjects.Text;
     private hintText: GameObjects.Text;
+    /** Online only: marks which of the two identical bars is this browser's. */
+    private youLabel: GameObjects.Text;
     private sparks: GameObjects.Particles.ParticleEmitter;
     /** One trail emitter per top, tinted in that top's own colours. */
     private flames = new Map<Bey, GameObjects.Particles.ParticleEmitter>();
@@ -85,6 +96,25 @@ export class Game extends Scene
 
     private cursors: Types.Input.Keyboard.CursorKeys;
     private keys: Record<string, Input.Keyboard.Key>;
+
+    /**
+     * Online play. Null for a local match against the AI. The host runs the
+     * real match; the guest runs a copy that the host's snapshots correct.
+     */
+    private netRole: NetRole | null = null;
+    private netOff: (() => void) | null = null;
+    /** The top this browser drives, and the one the other browser drives. */
+    private local!: Bey;
+    private remote!: Bey;
+    private lastSnapAt = 0;
+    private lastInputAt = 0;
+    /** Guest side: what this browser wants to do, on its way to the host. */
+    private pendingInput = { dx: 0, dy: 0, dash: false, special: false };
+    /** Host side: the last thing the guest asked for. */
+    private remoteInput = { dx: 0, dy: 0, dash: false, special: false };
+    private remoteMashes = 0;
+    /** Seconds the guest has disagreed with the host about the phase. */
+    private phaseDrift = 0;
 
     private phase: Phase = 'countdown';
     private countdown = 3;
@@ -143,6 +173,11 @@ export class Game extends Scene
         this.phase = 'countdown';
         this.countdown = 3;
         this.charger = null;
+        this.netRole = net.online ? net.role : null;
+        this.remoteInput = { dx: 0, dy: 0, dash: false, special: false };
+        this.pendingInput = { dx: 0, dy: 0, dash: false, special: false };
+        this.remoteMashes = 0;
+        this.phaseDrift = 0;
         this.hitStop = 0;
         this.lastBeep = 4;
         this.specialImpactTime = -9999;
@@ -184,6 +219,18 @@ export class Game extends Scene
             accel: 1260,
             maxSpeed: 760
         });
+
+        // Online the cyan top always belongs to the host, so both browsers
+        // draw the same picture; only "yours" differs.
+        this.local = this.netRole === 'guest' ? this.enemy : this.player;
+        this.remote = this.netRole === 'guest' ? this.player : this.enemy;
+
+        if (this.netRole)
+        {
+            // Player versus player: no reason for one side to be quicker.
+            this.enemy.accel = this.player.accel;
+            this.enemy.maxSpeed = this.player.maxSpeed;
+        }
 
         this.sparks = this.add.particles(0, 0, 'spark', {
             speed: { min: 80, max: 320 },
@@ -257,11 +304,23 @@ export class Game extends Scene
             fontFamily: 'Arial', fontSize: 18, color: '#9fd8ff'
         }).setOrigin(0.5).setDepth(101);
 
+        // Both browsers draw the same picture, so say which top is yours.
+        const mine = this.local === this.player;
+        this.youLabel = this.add.text(mine ? 44 : 1024 - 44, 8, 'VOCE', {
+            fontFamily: 'Arial Black', fontSize: 16, color: '#ffffff',
+            stroke: '#000000', strokeThickness: 5
+        }).setOrigin(mine ? 0 : 1, 0).setDepth(101).setVisible(this.netRole !== null);
+
         const keyboard = this.input.keyboard!;
         this.cursors = keyboard.createCursorKeys();
         this.keys = keyboard.addKeys('W,A,S,D,SPACE,SHIFT,R,M') as Record<string, Input.Keyboard.Key>;
 
-        keyboard.on('keydown-R', () => this.scene.restart());
+        keyboard.on('keydown-R', () =>
+        {
+            // Only the host may restart, so the two never start out of step.
+            if (this.netRole === 'guest') net.send({ t: 'rq' });
+            else this.restartMatch();
+        });
         keyboard.on('keydown-M', () =>
         {
             EventBus.emit('audio-muted', sfx.toggleMute());
@@ -271,9 +330,17 @@ export class Game extends Scene
         keyboard.on('keydown', () => sfx.unlock());
         this.input.on('pointerdown', () => sfx.unlock());
 
-        this.events.once('shutdown', () => sfx.stopAll());
+        this.netOff?.();
+        this.netOff = net.on((message) => this.onNetMessage(message));
 
-        if (DEBUG_FULL_METER)
+        this.events.once('shutdown', () =>
+        {
+            sfx.stopAll();
+            this.netOff?.();
+            this.netOff = null;
+        });
+
+        if (DEBUG_FULL_METER && !this.netRole)
         {
             this.player.meter = 100;
             this.enemy.meter = 100;
@@ -283,6 +350,15 @@ export class Game extends Scene
     }
 
     update (_time: number, delta: number)
+    {
+        this.step(delta);
+
+        // After the frame, so the host ships the state it just simulated and
+        // the guest ships the input it just read.
+        if (this.netRole) this.netPump();
+    }
+
+    private step (delta: number): void
     {
         const dt = Math.min(delta / 1000, 1 / 30);
 
@@ -326,11 +402,13 @@ export class Game extends Scene
         if (this.phase === 'battle' || this.phase === 'special')
         {
             this.handleInput(dt);
-            this.updateAI(dt);
+
+            if (this.netRole === 'host') this.applyRemoteInput(dt);
+            else if (!this.netRole) this.updateAI(dt);
 
             // Meter fills over time; the AI charges a touch slower.
             this.player.gainMeter(6 * dt);
-            this.enemy.gainMeter(5 * dt);
+            this.enemy.gainMeter(this.netRole ? 6 * dt : 5 * dt);
 
             // The drone tracks the liveliest top on the floor.
             sfx.updateDrone(
@@ -358,7 +436,8 @@ export class Game extends Scene
         this.drawHud();
 
         if ((this.phase === 'battle' || this.phase === 'special')
-            && (!this.player.alive || !this.enemy.alive))
+            && (!this.player.alive || !this.enemy.alive)
+            && this.netRole !== 'guest')
         {
             this.finish();
         }
@@ -405,28 +484,91 @@ export class Game extends Scene
         if (this.cursors.up.isDown || this.keys.W.isDown) dy -= 1;
         if (this.cursors.down.isDown || this.keys.S.isDown) dy += 1;
 
-        this.player.steer(dx, dy, dt);
+        // Offline this is always the cyan top; as the guest it is the red one.
+        const me = this.local;
+        const foe = this.remote;
+
+        me.steer(dx, dy, dt);
+
+        this.pendingInput.dx = dx;
+        this.pendingInput.dy = dy;
 
         if (Input.Keyboard.JustDown(this.keys.SPACE))
         {
             // Dash follows the stick, or lunges at the opponent when idle.
             const useAim = dx !== 0 || dy !== 0;
-            const ax = useAim ? dx : this.enemy.pos.x - this.player.pos.x;
-            const ay = useAim ? dy : this.enemy.pos.y - this.player.pos.y;
+            const ax = useAim ? dx : foe.pos.x - me.pos.x;
+            const ay = useAim ? dy : foe.pos.y - me.pos.y;
 
-            if (this.player.dash(ax, ay))
+            // The guest plays the dash straight away and tells the host in the
+            // same breath: a burst of speed is cheap to predict and wrong by
+            // at most one correction if the host disagrees.
+            if (me.dash(ax, ay))
             {
-                this.sparks.emitParticleAt(this.player.pos.x, this.player.pos.y, 6);
-                this.dashPing(this.player);
+                this.sparks.emitParticleAt(me.pos.x, me.pos.y, 6);
+                this.dashPing(me);
                 sfx.dash();
+            }
+
+            if (this.netRole === 'guest')
+            {
+                this.pendingInput.dash = true;
+                this.flushInput();
             }
         }
 
         if (Input.Keyboard.JustDown(this.keys.SHIFT)
             && this.phase === 'battle'
-            && this.player.specialReady)
+            && me.specialReady)
         {
-            this.startSpecial(this.player, this.enemy);
+            if (this.netRole === 'guest')
+            {
+                // The host owns every cinematic: ask, then wait for the cue.
+                this.pendingInput.special = true;
+                this.flushInput();
+            }
+            else
+            {
+                this.startSpecial(me, foe);
+            }
+        }
+    }
+
+    /** Host side: drives the remote top from the last packet the guest sent. */
+    private applyRemoteInput (dt: number): void
+    {
+        const me = this.remote;
+        const foe = this.local;
+        const input = this.remoteInput;
+
+        if (!me.alive) return;
+
+        me.steer(input.dx, input.dy, dt);
+
+        if (input.dash)
+        {
+            input.dash = false;
+
+            const aiming = input.dx !== 0 || input.dy !== 0;
+            const ax = aiming ? input.dx : foe.pos.x - me.pos.x;
+            const ay = aiming ? input.dy : foe.pos.y - me.pos.y;
+
+            if (me.dash(ax, ay))
+            {
+                this.sparks.emitParticleAt(me.pos.x, me.pos.y, 6);
+                this.dashPing(me);
+                sfx.dash();
+            }
+        }
+
+        if (input.special)
+        {
+            input.special = false;
+
+            if (this.phase === 'battle' && me.specialReady)
+            {
+                this.startSpecial(me, foe);
+            }
         }
     }
 
@@ -512,7 +654,7 @@ export class Game extends Scene
     // -- special attack ---------------------------------------------------
 
     /** Freezes the match and starts the wind-up cinematic. */
-    private startSpecial (bey: Bey, target: Bey): void
+    private startSpecial (bey: Bey, target: Bey, dir?: PMath.Vector2): void
     {
         this.phase = 'charging';
         this.charger = bey;
@@ -521,10 +663,19 @@ export class Game extends Scene
         this.orbitTimer = 0;
 
         // Direction is locked at the start of the charge, with a bit of lead.
-        this.chargeDir.set(
-            target.pos.x + target.vel.x * 0.12 - bey.pos.x,
-            target.pos.y + target.vel.y * 0.12 - bey.pos.y
-        ).normalize();
+        // Online the host works it out and the guest is told, so the two see
+        // the same dash even though their positions drifted a little apart.
+        if (dir)
+        {
+            this.chargeDir.copy(dir);
+        }
+        else
+        {
+            this.chargeDir.set(
+                target.pos.x + target.vel.x * 0.12 - bey.pos.x,
+                target.pos.y + target.vel.y * 0.12 - bey.pos.y
+            ).normalize();
+        }
 
         this.player.frozen = true;
         this.enemy.frozen = true;
@@ -543,6 +694,17 @@ export class Game extends Scene
 
         this.cameras.main.shake(CHARGE_TIME * 1000, 0.004);
         sfx.chargeUp(CHARGE_TIME);
+
+        this.netEvent({
+            t: 'charge',
+            who: bey === this.player ? 'p' : 'e',
+            dx: this.chargeDir.x,
+            dy: this.chargeDir.y,
+            px: this.player.pos.x,
+            py: this.player.pos.y,
+            ex: this.enemy.pos.x,
+            ey: this.enemy.pos.y
+        });
     }
 
     private updateCharge (dt: number): void
@@ -1131,7 +1293,9 @@ export class Game extends Scene
         // Only a special finishes with the cinematic: the two lock together and
         // grind before the loser comes apart. Ordinary and rail kills just end
         // the round with the loser toppling over.
-        if (special && (this.phase === 'battle' || this.phase === 'special') && (!a.alive || !b.alive))
+        if (special && this.netRole !== 'guest'
+            && (this.phase === 'battle' || this.phase === 'special')
+            && (!a.alive || !b.alive))
         {
             const winner = a.alive ? a : b;
             const loser = a.alive ? b : a;
@@ -1282,17 +1446,21 @@ export class Game extends Scene
         const defender = charger === this.player ? this.enemy : this.player;
         if (!defender.specialReady) return;
 
-        if (defender === this.player)
+        if (defender === this.local)
         {
             this.duelHint.setText('SHIFT: REVIDAR').setAlpha(1);
 
             if (Input.Keyboard.JustDown(this.keys.SHIFT))
             {
-                this.startDuel();
+                if (this.netRole === 'guest') net.send({ t: 'counter' });
+                else this.startDuel();
             }
 
             return;
         }
+
+        // Online the other browser answers for itself.
+        if (this.netRole) return;
 
         // The AI only gets one chance to read the attack, part way in.
         if (!this.duelCounterRolled && t > 0.4)
@@ -1318,6 +1486,9 @@ export class Game extends Scene
         this.duelAiTimer = PMath.FloatBetween(0.25, 0.4);
         this.duelHits = [];
         this.duelCounterRolled = true;
+        this.remoteMashes = 0;
+
+        this.netEvent({ t: 'duel' });
 
         // Everything else stops: both specials are burnt on this.
         this.endSpecial();
@@ -1349,6 +1520,7 @@ export class Game extends Scene
 
         this.hud.setVisible(false);
         this.hintText.setVisible(false);
+        this.youLabel.setVisible(false);
 
         this.duelText.setAlpha(1);
 
@@ -1371,16 +1543,36 @@ export class Game extends Scene
         this.duelShock -= dt;
         this.duelAiTimer -= dt;
 
-        // Player input: every press is a shove.
+        // Player input: every press is a shove. The guest only asks for one;
+        // the host is what makes it count.
         if (Input.Keyboard.JustDown(this.keys.SPACE))
         {
-            this.duelPlayer++;
-            this.duelPress(this.player, this.enemy, this.duelPlayer);
+            if (this.netRole === 'guest')
+            {
+                net.send({ t: 'mash' });
+            }
+            else
+            {
+                this.duelPlayer++;
+                this.duelPress(this.player, this.enemy, this.duelPlayer);
+                this.netEvent({ t: 'dp', who: 'p', n: this.duelPlayer });
+            }
         }
 
-        // The AI mashes at a human-ish rate, with a wobble so it is beatable.
-        if (this.duelAiTimer <= 0)
+        if (this.netRole === 'host')
         {
+            // Every press the guest managed since the last frame.
+            while (this.remoteMashes > 0)
+            {
+                this.remoteMashes--;
+                this.duelEnemy++;
+                this.duelPress(this.enemy, this.player, this.duelEnemy);
+                this.netEvent({ t: 'dp', who: 'e', n: this.duelEnemy });
+            }
+        }
+        else if (!this.netRole && this.duelAiTimer <= 0)
+        {
+            // The AI mashes at a human-ish rate, with a wobble so it is beatable.
             this.duelAiTimer = PMath.FloatBetween(0.17, 0.29);
             this.duelEnemy++;
             this.duelPress(this.enemy, this.player, this.duelEnemy);
@@ -1428,6 +1620,9 @@ export class Game extends Scene
 
         this.duelText.setText(`${this.duelPlayer}   -   ${this.duelEnemy}`);
         this.duelText.setPosition(ARENA_X + this.duelOffset * 0.5, ARENA_Y - 96);
+
+        // Only the host calls the duel; the guest waits to be told.
+        if (this.netRole === 'guest') return;
 
         if (this.duelPlayer >= DUEL_TARGET || this.duelEnemy >= DUEL_TARGET)
         {
@@ -1523,9 +1718,17 @@ export class Game extends Scene
     }
 
     /** The lock breaks: the loser is thrown across the stadium, out of control. */
-    private endDuel (winner: Bey, loser: Bey): void
+    private endDuel (winner: Bey, loser: Bey, launchAngle?: number): void
     {
         this.phase = 'battle';
+
+        const angle = launchAngle ?? PMath.FloatBetween(-0.35, 0.35);
+
+        this.netEvent({
+            t: 'de',
+            who: winner === this.player ? 'p' : 'e',
+            a: angle
+        });
 
         sfx.duelBreak();
         music.duck(1);
@@ -1535,6 +1738,7 @@ export class Game extends Scene
         this.duelHint.setAlpha(0);
         this.hud.setVisible(true);
         this.hintText.setVisible(true);
+        this.youLabel.setVisible(this.netRole !== null);
 
         for (const bey of [this.player, this.enemy])
         {
@@ -1547,7 +1751,6 @@ export class Game extends Scene
 
         // Both start from the middle; the loser leaves it a lot faster.
         const dir = loser === this.enemy ? 1 : -1;
-        const angle = PMath.FloatBetween(-0.35, 0.35);
 
         loser.pos.set(ARENA_X + dir * (loser.radius + 4), ARENA_Y);
         loser.vel.set(
@@ -1612,6 +1815,15 @@ export class Game extends Scene
      */
     private startClash (winner: Bey, loser: Bey): void
     {
+        this.netEvent({
+            t: 'clash',
+            who: winner === this.player ? 'p' : 'e',
+            wx: winner.pos.x,
+            wy: winner.pos.y,
+            lx: loser.pos.x,
+            ly: loser.pos.y
+        });
+
         this.phase = 'clash';
         this.clashWinner = winner;
         this.clashLoser = loser;
@@ -1648,6 +1860,7 @@ export class Game extends Scene
 
         this.hud.setVisible(false);
         this.hintText.setVisible(false);
+        this.youLabel.setVisible(false);
 
         sfx.stopDrone();
         sfx.clashRev(CLASH_TIME);
@@ -1783,6 +1996,7 @@ export class Game extends Scene
 
         this.hud.setVisible(true);
         this.hintText.setVisible(true);
+        this.youLabel.setVisible(this.netRole !== null);
 
         this.shatterBey(loser);
         if (!winner.alive)
@@ -2112,9 +2326,321 @@ export class Game extends Scene
         g.fillCircle(pipX, my + mh + 12, 6);
     }
 
+    // -- online play ------------------------------------------------------
+
+    /** Restarts both browsers at once. Host only: the guest asks with 'rq'. */
+    private restartMatch (): void
+    {
+        this.netEvent({ t: 'rs' });
+        this.scene.restart();
+    }
+
+    /** Host-only broadcast. Called from code both sides run, so it must check. */
+    private netEvent (message: NetMessage): void
+    {
+        if (this.netRole !== 'host') return;
+
+        net.send(message);
+    }
+
+    private flushInput (): void
+    {
+        net.send({
+            t: 'in',
+            x: this.pendingInput.dx,
+            y: this.pendingInput.dy,
+            d: this.pendingInput.dash,
+            s: this.pendingInput.special
+        });
+
+        this.pendingInput.dash = false;
+        this.pendingInput.special = false;
+        this.lastInputAt = this.time.now;
+    }
+
+    /** End of frame: the host ships state, the guest ships input. */
+    private netPump (): void
+    {
+        if (!net.online)
+        {
+            // The other side went away. Play the round out on our own.
+            this.netRole = null;
+            return;
+        }
+
+        const now = this.time.now;
+
+        if (this.netRole === 'host')
+        {
+            if (now - this.lastSnapAt < 1000 / NET_SNAPSHOT_HZ) return;
+
+            this.lastSnapAt = now;
+            net.send(this.snapshot());
+
+            return;
+        }
+
+        if (now - this.lastInputAt < 1000 / NET_INPUT_HZ) return;
+
+        this.flushInput();
+    }
+
+    private snapshot (): NetMessage
+    {
+        return {
+            t: 'snap',
+            ph: this.phase,
+            p: this.beyState(this.player),
+            e: this.beyState(this.enemy),
+            dp: this.duelPlayer,
+            de: this.duelEnemy
+        };
+    }
+
+    /** Everything about a top the other side cannot work out for itself. */
+    private beyState (bey: Bey): number[]
+    {
+        const r = (v: number, places: number) =>
+        {
+            const f = 10 ** places;
+
+            return Math.round(v * f) / f;
+        };
+
+        return [
+            r(bey.pos.x, 1), r(bey.pos.y, 1),
+            r(bey.vel.x, 0), r(bey.vel.y, 0),
+            r(bey.spin, 1), r(bey.meter, 1),
+            r(bey.special, 2), r(bey.boost, 2), r(bey.tumble, 2),
+            r(bey.dashCooldown, 2), r(bey.railCooldown, 2),
+            bey.onRail ? 1 : 0, bey.alive ? 1 : 0, bey.ringOut ? 1 : 0
+        ];
+    }
+
+    private applySnapshot (message: NetMessage): void
+    {
+        this.applyBeyState(this.player, message.p as number[], this.player === this.local);
+        this.applyBeyState(this.enemy, message.e as number[], this.enemy === this.local);
+
+        if (this.phase === 'duel')
+        {
+            this.duelPlayer = message.dp as number;
+            this.duelEnemy = message.de as number;
+        }
+
+        // Cinematics are driven by events, so a lasting disagreement means one
+        // was dropped. Give it a beat, then fall back in behind the host.
+        if (message.ph === this.phase)
+        {
+            this.phaseDrift = 0;
+            return;
+        }
+
+        this.phaseDrift += 1 / NET_SNAPSHOT_HZ;
+
+        if (this.phaseDrift < NET_PHASE_GRACE) return;
+
+        this.phaseDrift = 0;
+
+        if (message.ph === 'battle' && this.phase !== 'over') this.forceBattle();
+    }
+
+    /**
+     * Authority lands here. The guest keeps simulating, because a top that only
+     * moved 30 times a second would look terrible, so this pulls its copy back
+     * towards the host's rather than replacing it: gently for the top the
+     * player is steering, hard for the other one, instantly when it is hopeless.
+     */
+    private applyBeyState (bey: Bey, state: number[], own: boolean): void
+    {
+        const [
+            x, y, vx, vy, spin, meter, special, boost, tumble,
+            dashCd, railCd, onRail, alive, ringOut
+        ] = state;
+
+        const gap = Math.hypot(x - bey.pos.x, y - bey.pos.y);
+        const k = gap > NET_SNAP_DISTANCE ? 1 : own ? 0.22 : 0.55;
+        const kv = own ? 0.35 : 1;
+
+        bey.pos.set(PMath.Linear(bey.pos.x, x, k), PMath.Linear(bey.pos.y, y, k));
+        bey.vel.set(PMath.Linear(bey.vel.x, vx, kv), PMath.Linear(bey.vel.y, vy, kv));
+
+        bey.spin = spin;
+        bey.meter = meter;
+        bey.special = special;
+        bey.boost = boost;
+        bey.tumble = tumble;
+        bey.dashCooldown = dashCd;
+        bey.railCooldown = railCd;
+        bey.ringOut = ringOut === 1;
+        bey.alive = alive === 1;
+
+        // Rails run locally on both sides. Only follow the host *out* of one:
+        // forcing a top onto a rail it never met would park it against a wall.
+        if (onRail === 0 && bey.onRail) this.releaseFromRail(bey);
+    }
+
+    /** Drops every cinematic and puts the stadium back the way it was. */
+    private forceBattle (): void
+    {
+        this.endSpecial();
+
+        this.phase = 'battle';
+        this.clashWinner = null;
+        this.clashLoser = null;
+
+        this.darkness.setAlpha(0);
+        this.aura.clear();
+        this.speedLines.clear();
+        this.specialText.setAlpha(0);
+        this.duelText.setAlpha(0);
+        this.duelHint.setAlpha(0);
+        this.hud.setVisible(true);
+        this.hintText.setVisible(true);
+        this.youLabel.setVisible(this.netRole !== null);
+
+        this.cameras.main.setZoom(1);
+        this.cameras.main.centerOn(ARENA_X, ARENA_Y);
+
+        for (const bey of [this.player, this.enemy])
+        {
+            bey.frozen = false;
+            bey.spinBoost = 0;
+            bey.shakeAmp = 0;
+            bey.setDepth(10);
+        }
+
+        sfx.stopCharge();
+        sfx.startDrone();
+    }
+
+    private onNetMessage (message: NetMessage): void
+    {
+        const side = (tag: unknown) => (tag === 'p' ? this.player : this.enemy);
+        const other = (bey: Bey) => (bey === this.player ? this.enemy : this.player);
+
+        switch (message.t)
+        {
+            // ---- guest to host ----
+            case 'in':
+                if (this.netRole !== 'host') break;
+                this.remoteInput.dx = message.x as number;
+                this.remoteInput.dy = message.y as number;
+                if (message.d) this.remoteInput.dash = true;
+                if (message.s) this.remoteInput.special = true;
+                break;
+
+            case 'mash':
+                if (this.netRole === 'host') this.remoteMashes++;
+                break;
+
+            case 'counter':
+                if (this.netRole === 'host'
+                    && this.phase === 'charging'
+                    && this.charger !== this.remote
+                    && this.remote.specialReady)
+                {
+                    this.startDuel();
+                }
+                break;
+
+            case 'rq':
+                if (this.netRole === 'host') this.restartMatch();
+                break;
+
+            // ---- host to guest ----
+            case 'snap':
+                if (this.netRole === 'guest') this.applySnapshot(message);
+                break;
+
+            case 'charge':
+            {
+                if (this.netRole !== 'guest' || this.phase === 'charging') break;
+
+                const bey = side(message.who);
+
+                this.player.pos.set(message.px as number, message.py as number);
+                this.enemy.pos.set(message.ex as number, message.ey as number);
+                this.startSpecial(
+                    bey,
+                    other(bey),
+                    new PMath.Vector2(message.dx as number, message.dy as number)
+                );
+                break;
+            }
+
+            case 'duel':
+                if (this.netRole === 'guest' && this.phase !== 'duel') this.startDuel();
+                break;
+
+            case 'dp':
+            {
+                if (this.netRole !== 'guest' || this.phase !== 'duel') break;
+
+                const striker = side(message.who);
+                const count = message.n as number;
+
+                if (striker === this.player) this.duelPlayer = count;
+                else this.duelEnemy = count;
+
+                this.duelPress(striker, other(striker), count);
+                break;
+            }
+
+            case 'de':
+            {
+                if (this.netRole !== 'guest' || this.phase !== 'duel') break;
+
+                const winner = side(message.who);
+
+                this.endDuel(winner, other(winner), message.a as number);
+                break;
+            }
+
+            case 'clash':
+            {
+                if (this.netRole !== 'guest' || this.phase === 'clash') break;
+
+                const winner = side(message.who);
+                const loser = other(winner);
+
+                winner.pos.set(message.wx as number, message.wy as number);
+                loser.pos.set(message.lx as number, message.ly as number);
+                loser.spin = 0;
+                loser.alive = false;
+
+                this.startClash(winner, loser);
+                break;
+            }
+
+            case 'over':
+                if (this.netRole !== 'guest') break;
+                this.player.alive = message.pa as boolean;
+                this.enemy.alive = message.ea as boolean;
+                this.player.ringOut = message.pr as boolean;
+                this.enemy.ringOut = message.er as boolean;
+                this.finish();
+                break;
+
+            case 'rs':
+                if (this.netRole === 'guest') this.scene.restart();
+                break;
+        }
+    }
+
     private finish (): void
     {
+        if (this.phase === 'over') return;
+
         this.phase = 'over';
+
+        this.netEvent({
+            t: 'over',
+            pa: this.player.alive,
+            ea: this.enemy.alive,
+            pr: this.player.ringOut,
+            er: this.enemy.ringOut
+        });
 
         // Let go of anything still meshed with a rail.
         for (const bey of this.rides.keys())
@@ -2131,8 +2657,8 @@ export class Game extends Scene
         this.specialText.setAlpha(0);
         this.aura.clear();
 
-        const playerLost = !this.player.alive;
-        const enemyLost = !this.enemy.alive;
+        const playerLost = !this.local.alive;
+        const enemyLost = !this.remote.alive;
 
         let title: string;
         if (playerLost && enemyLost)
@@ -2141,11 +2667,11 @@ export class Game extends Scene
         }
         else if (enemyLost)
         {
-            title = this.enemy.ringOut ? 'RING OUT!\nVOCE VENCEU' : 'VOCE VENCEU';
+            title = this.remote.ringOut ? 'RING OUT!\nVOCE VENCEU' : 'VOCE VENCEU';
         }
         else
         {
-            title = this.player.ringOut ? 'RING OUT!\nVOCE PERDEU' : 'VOCE PERDEU';
+            title = this.local.ringOut ? 'RING OUT!\nVOCE PERDEU' : 'VOCE PERDEU';
         }
 
         const score = this.registry.get('score') as { win: number; loss: number } | undefined
