@@ -13,6 +13,9 @@ export class Sfx
 
     private muted = false;
 
+    /** Sub-bus the music runs through, so mute and the limiter cover it too. */
+    private musicGain: GainNode | null = null;
+
     /**
      * The signature spin sound: the toothed tip ratcheting along the stadium
      * rail. Low, buzzy and dense - a growl, not a whistle.
@@ -94,6 +97,22 @@ export class Sfx
         }
 
         return this.ctx;
+    }
+
+    /** Context plus a dedicated bus for the music. Null before audio exists. */
+    musicBus (): { ctx: AudioContext; out: GainNode } | null
+    {
+        const ctx = this.ensure();
+        if (!ctx || !this.master) return null;
+
+        if (!this.musicGain)
+        {
+            this.musicGain = ctx.createGain();
+            this.musicGain.gain.value = 1;
+            this.musicGain.connect(this.master);
+        }
+
+        return { ctx, out: this.musicGain };
     }
 
     /** Call from a click / keypress so the browser lets the audio through. */

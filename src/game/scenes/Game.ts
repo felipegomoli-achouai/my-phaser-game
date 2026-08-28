@@ -2,6 +2,7 @@ import { Scene, Math as PMath, GameObjects, Input, Types } from 'phaser';
 import { EventBus } from '../EventBus';
 import { Bey } from '../Bey';
 import { sfx } from '../Sfx';
+import { music } from '../Music';
 
 const ARENA_X = 512;
 const ARENA_Y = 384;
@@ -379,6 +380,7 @@ export class Game extends Scene
         {
             this.phase = 'battle';
             sfx.startDrone();
+            music.start();
             this.centerText.setText('');
             // Both tops get shot into the arena.
             // Launched sideways, towards the rails, not at the open mouths.
@@ -1353,6 +1355,7 @@ export class Game extends Scene
         sfx.stopDrone();
         sfx.duelStart();
         sfx.duelGrind();
+        music.duck(0.2);
 
         this.cameras.main.flash(200, 255, 255, 255);
         this.cameras.main.shake(400, 0.03);
@@ -1525,6 +1528,7 @@ export class Game extends Scene
         this.phase = 'battle';
 
         sfx.duelBreak();
+        music.duck(1);
 
         this.aura.clear();
         this.duelText.setAlpha(0);
@@ -1647,6 +1651,7 @@ export class Game extends Scene
 
         sfx.stopDrone();
         sfx.clashRev(CLASH_TIME);
+        music.duck(0.25);
     }
 
     private updateClash (dt: number): void
@@ -1774,6 +1779,7 @@ export class Game extends Scene
         winner.vel.set(away.x * 520, away.y * 520);
 
         sfx.clashBreak();
+        music.duck(1);
 
         this.hud.setVisible(true);
         this.hintText.setVisible(true);
