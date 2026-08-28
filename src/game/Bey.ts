@@ -65,6 +65,11 @@ export class Bey
     /** Seconds of being flung around with no control after a heavy hit. */
     public tumble = 0;
 
+    /** Seconds left on each of the four ability keys. */
+    public cooldowns: number[] = [0, 0, 0, 0];
+    /** Seconds of shrugging off the sludge patches, granted by the repulsor. */
+    public slowFree = 0;
+
     private container: GameObjects.Container;
     private disc: GameObjects.Image;
     private shadow: GameObjects.Image;
@@ -79,7 +84,7 @@ export class Bey
 
         this.radius = config.radius ?? 26;
         this.mass = config.mass ?? 1;
-        this.maxSpin = config.maxSpin ?? 130;
+        this.maxSpin = config.maxSpin ?? 240;
         this.spin = this.maxSpin;
         this.accel = config.accel ?? 950;
         this.maxSpeed = config.maxSpeed ?? 520;
@@ -178,6 +183,14 @@ export class Bey
     {
         this.dashCooldown = Math.max(0, this.dashCooldown - dt);
         this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
+        this.slowFree = Math.max(0, this.slowFree - dt);
+
+        // Abilities are on a clock and nothing else, so it runs even while the
+        // stadium is frozen for a cinematic.
+        for (let i = 0; i < this.cooldowns.length; i++)
+        {
+            this.cooldowns[i] = Math.max(0, this.cooldowns[i] - dt);
+        }
 
         if (this.frozen)
         {

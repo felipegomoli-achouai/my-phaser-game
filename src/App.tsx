@@ -126,7 +126,9 @@ function App()
                 <h1>BEYBLADE PROTO</h1>
                 <p>
                     Jogue o oponente pelos buracos ao norte e ao sul, ou zere o giro dele.
-                    Os trilhos laterais prendem a ponta, aceleram e lançam contra o centro.
+                    A mesa é um pinball: pinos laranja rebatem, as setas azuis empurram,
+                    a lama verde freia, e os trilhos (retos e em arco) prendem a ponta e
+                    lançam. Habilidades só têm cooldown, então use sempre.
                 </p>
                 <ul>
                     <li><b>WASD / setas</b> — mover</li>
@@ -134,6 +136,10 @@ function App()
                     <li><b>Shift</b> — especial (barra amarela cheia)</li>
                     <li><b>Shift</b> durante o especial do oponente — revida e abre o duelo</li>
                     <li><b>Espaço</b> no duelo — 10 pancadas primeiro vence</li>
+                    <li><b>1</b> Serra — disco que ricocheteia</li>
+                    <li><b>2</b> Corte — golpe curto, empurrão pesado</li>
+                    <li><b>3</b> Vórtice — poço que puxa o oponente</li>
+                    <li><b>4</b> Repulsor — onda que afasta e destrói serras</li>
                     <li><b>R</b> — reiniciar</li>
                     <li><b>M</b> — mudo</li>
                 </ul>

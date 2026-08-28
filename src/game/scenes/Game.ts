@@ -4,17 +4,21 @@ import { Bey } from '../Bey';
 import { sfx } from '../Sfx';
 import { music } from '../Music';
 import { net, type NetMessage, type NetRole } from '../Net';
+import {
+    ABILITIES, ABILITY_COUNT, KIND_ORDER,
+    REPULSE_DAMAGE, REPULSE_FREE, REPULSE_KNOCK, REPULSE_LIFE, REPULSE_RADIUS,
+    SAW_BOUNCES, SAW_DAMAGE, SAW_KNOCK, SAW_LIFE, SAW_RADIUS, SAW_SPEED,
+    SLASH_ARC, SLASH_DAMAGE, SLASH_KNOCK, SLASH_LIFE, SLASH_RANGE, SLASH_TUMBLE,
+    VORTEX_DAMAGE, VORTEX_LIFE, VORTEX_PULL, VORTEX_RADIUS,
+    isPersistent, type AbilityId, type Fx
+} from '../Abilities';
+import {
+    ARENA_R, ARENA_X, ARENA_Y, GAP_ANGLES, GAP_HALF, VIEW_H, VIEW_W,
+    buildArena, isInGap, railMouth, railPoint, railProject, railTangent,
+    type ArenaLayout, type Rail
+} from '../Arena';
 
-const ARENA_X = 512;
-const ARENA_Y = 384;
-const ARENA_R = 320;
-
-/** The stadium is closed except for two mouths, north and south. */
-const GAP_ANGLES = [-Math.PI / 2, Math.PI / 2];
-const GAP_HALF = PMath.DegToRad(21);
-
-/** Side rails: the tip meshes with the teeth and gets slung at the middle. */
-const RAIL_LENGTH = 215;
+/** Rails: the tip meshes with the teeth and is carried along them. */
 const RAIL_MOUTH = 78;
 const RAIL_CAPTURE_WIDTH = 32;
 const RAIL_TOP_SPEED = 1320;
@@ -40,8 +44,12 @@ const DUEL_AI_COUNTER_CHANCE = 0.75;
 const CLASH_TIME = 1.9;
 const CLASH_ZOOM = 0.9;
 
-/** The mouths have a low lip: only a real shove clears it. */
-const GAP_ESCAPE_SPEED = 320;
+/**
+ * The mouths have a lip, and on a pinball table it has to be a high one: the
+ * rails and the posts throw a top around hard enough that a stray ricochet
+ * would end the round, so only a committed, aimed shove clears it.
+ */
+const GAP_ESCAPE_SPEED = 880;
 
 /** Special attack tuning. */
 const CHARGE_TIME = 1.25;
@@ -62,18 +70,16 @@ const NET_SNAP_DISTANCE = 120;
 /** How long the guest tolerates being in a different phase before resyncing. */
 const NET_PHASE_GRACE = 1.5;
 
+/** Which key fires which ability, in order. */
+const ABILITY_KEYS = ['ONE', 'TWO', 'THREE', 'FOUR'];
+
+/** Where the vortex is dropped, measured out in front of the caster. */
+const VORTEX_THROW = 180;
+
 /** Debug: player starts with the special meter already full. */
 const DEBUG_FULL_METER = true;
 
 type Phase = 'countdown' | 'battle' | 'charging' | 'special' | 'duel' | 'clash' | 'over';
-
-/** A straight toothed rail running from the wall to the middle of the floor. */
-interface Rail
-{
-    start: PMath.Vector2;
-    dir: PMath.Vector2;
-    length: number;
-}
 
 export class Game extends Scene
 {
@@ -97,6 +103,16 @@ export class Game extends Scene
     private cursors: Types.Input.Keyboard.CursorKeys;
     private keys: Record<string, Input.Keyboard.Key>;
 
+    /** Abilities in flight: saws travelling, wells sitting on the floor. */
+    private fx: Fx[] = [];
+    private fxSeq = 1;
+    private fxLayer: GameObjects.Graphics;
+    /** Short-lived flashes, replayed from the cast rather than simulated. */
+    private slashes: { bey: Bey; angle: number; at: number }[] = [];
+    private rings: { x: number; y: number; at: number; color: number }[] = [];
+    /** The digits drawn on the local player's ability pips. */
+    private abilityKeys: GameObjects.Text[] = [];
+
     /**
      * Online play. Null for a local match against the AI. The host runs the
      * real match; the guest runs a copy that the host's snapshots correct.
@@ -109,9 +125,9 @@ export class Game extends Scene
     private lastSnapAt = 0;
     private lastInputAt = 0;
     /** Guest side: what this browser wants to do, on its way to the host. */
-    private pendingInput = { dx: 0, dy: 0, dash: false, special: false };
+    private pendingInput = { dx: 0, dy: 0, dash: false, special: false, ability: -1 };
     /** Host side: the last thing the guest asked for. */
-    private remoteInput = { dx: 0, dy: 0, dash: false, special: false };
+    private remoteInput = { dx: 0, dy: 0, dash: false, special: false, ability: -1 };
     private remoteMashes = 0;
     /** Seconds the guest has disagreed with the host about the phase. */
     private phaseDrift = 0;
@@ -133,6 +149,11 @@ export class Game extends Scene
     /** When the last special connected, so a follow-up ring out counts as its kill. */
     private specialImpactTime = -9999;
     private shattered = new Set<Bey>();
+
+    /** The table: rails, posts, pads and sludge. */
+    private layout: ArenaLayout = buildArena();
+    /** When each post was last hit, for the flash it throws off. */
+    private bumperHits = new Map<number, number>();
 
     /** Rail state. */
     private rails: Rail[] = [];
@@ -176,8 +197,12 @@ export class Game extends Scene
         this.countdown = 3;
         this.charger = null;
         this.netRole = net.online ? net.role : null;
-        this.remoteInput = { dx: 0, dy: 0, dash: false, special: false };
-        this.pendingInput = { dx: 0, dy: 0, dash: false, special: false };
+        this.remoteInput = { dx: 0, dy: 0, dash: false, special: false, ability: -1 };
+        this.pendingInput = { dx: 0, dy: 0, dash: false, special: false, ability: -1 };
+        this.fx = [];
+        this.fxSeq = 1;
+        this.slashes = [];
+        this.rings = [];
         this.remoteMashes = 0;
         this.phaseDrift = 0;
         this.netResync = false;
@@ -186,7 +211,9 @@ export class Game extends Scene
         this.specialImpactTime = -9999;
         this.shattered = new Set<Bey>();
         this.rides = new Map();
-        this.rails = this.buildRails();
+        this.layout = buildArena();
+        this.rails = this.layout.rails;
+        this.bumperHits = new Map();
         this.clashWinner = null;
         this.clashLoser = null;
         this.duelCounterRolled = false;
@@ -205,7 +232,7 @@ export class Game extends Scene
             name: 'player',
             color: 0x2ee6ff,
             accent: 0x0b4b6b,
-            x: ARENA_X - 150,
+            x: ARENA_X - 230,
             y: ARENA_Y,
             spinDir: 1,
             accel: 1350,
@@ -216,7 +243,7 @@ export class Game extends Scene
             name: 'enemy',
             color: 0xff4d5a,
             accent: 0x6b0b1c,
-            x: ARENA_X + 150,
+            x: ARENA_X + 230,
             y: ARENA_Y,
             spinDir: -1,
             accel: 1260,
@@ -273,11 +300,12 @@ export class Game extends Scene
 
         // Cinematic dimmer: sits above the arena, below the charging bey.
         // Oversized so the zoom-in never reveals its edges.
-        this.darkness = this.add.rectangle(ARENA_X, ARENA_Y, 2400, 1800, 0x000000)
+        this.darkness = this.add.rectangle(ARENA_X, ARENA_Y, 3200, 2400, 0x000000)
             .setAlpha(0)
             .setDepth(20);
 
         this.railGlow = this.add.graphics().setDepth(2);
+        this.fxLayer = this.add.graphics().setDepth(11);
         this.speedLines = this.add.graphics().setDepth(12);
         this.aura = this.add.graphics().setDepth(55);
         this.hud = this.add.graphics().setDepth(100);
@@ -302,21 +330,34 @@ export class Game extends Scene
             stroke: '#000000', strokeThickness: 6, align: 'center'
         }).setOrigin(0.5).setDepth(103).setAlpha(0);
 
-        this.hintText = this.add.text(ARENA_X, 740,
-            'WASD: mover   ESPACO: investida   SHIFT: especial (e revide)   |   trilhos aceleram, buracos ao norte e sul eliminam', {
+        this.hintText = this.add.text(ARENA_X, VIEW_H - 26,
+            'WASD: mover   ESPACO: investida   SHIFT: especial (e revide)   1-4: habilidades   |   trilhos aceleram, buracos ao norte e sul eliminam', {
             fontFamily: 'Arial', fontSize: 18, color: '#9fd8ff'
         }).setOrigin(0.5).setDepth(101);
 
         // Both browsers draw the same picture, so say which top is yours.
         const mine = this.local === this.player;
-        this.youLabel = this.add.text(mine ? 44 : 1024 - 44, 8, 'VOCE', {
+        this.youLabel = this.add.text(mine ? 44 : VIEW_W - 44, 8, 'VOCE', {
             fontFamily: 'Arial Black', fontSize: 16, color: '#ffffff',
             stroke: '#000000', strokeThickness: 5
         }).setOrigin(mine ? 0 : 1, 0).setDepth(101).setVisible(this.netRole !== null);
 
+        // Digits on the ability pips, positioned by drawBar each frame.
+        this.abilityKeys = [];
+        for (let i = 0; i < ABILITY_COUNT; i++)
+        {
+            this.abilityKeys.push(
+                this.add.text(-100, -100, String(i + 1), {
+                    fontFamily: 'Arial Black', fontSize: 14, color: '#0a121c'
+                }).setOrigin(0.5).setDepth(102)
+            );
+        }
+
         const keyboard = this.input.keyboard!;
         this.cursors = keyboard.createCursorKeys();
-        this.keys = keyboard.addKeys('W,A,S,D,SPACE,SHIFT,R,M') as Record<string, Input.Keyboard.Key>;
+        this.keys = keyboard.addKeys(
+            'W,A,S,D,SPACE,SHIFT,R,M,ONE,TWO,THREE,FOUR'
+        ) as Record<string, Input.Keyboard.Key>;
 
         keyboard.on('keydown-R', () =>
         {
@@ -439,8 +480,11 @@ export class Game extends Scene
         this.enemy.update(dt);
 
         this.updateTrails(dt);
+        this.updateFx(dt);
         this.updateRails(dt);
 
+        this.collideObstacles(this.player, dt);
+        this.collideObstacles(this.enemy, dt);
         this.collideWithWall(this.player);
         this.collideWithWall(this.enemy);
         this.collideBeys();
@@ -451,6 +495,7 @@ export class Game extends Scene
         }
 
         this.drawRailGlow();
+        this.drawFx();
         this.drawHud();
 
         if ((this.phase === 'battle' || this.phase === 'special')
@@ -550,6 +595,22 @@ export class Game extends Scene
                 this.startSpecial(me, foe);
             }
         }
+
+        for (let i = 0; i < ABILITY_COUNT; i++)
+        {
+            if (!Input.Keyboard.JustDown(this.keys[ABILITY_KEYS[i]])) continue;
+
+            if (this.netRole === 'guest')
+            {
+                // The host owns the cooldown and the effect; ask for it.
+                this.pendingInput.ability = i;
+                this.flushInput();
+            }
+            else
+            {
+                this.castAbility(me, i);
+            }
+        }
     }
 
     /** Host side: drives the remote top from the last packet the guest sent. */
@@ -587,6 +648,469 @@ export class Game extends Scene
             {
                 this.startSpecial(me, foe);
             }
+        }
+
+        if (input.ability >= 0)
+        {
+            const index = input.ability;
+            input.ability = -1;
+            this.castAbility(me, index);
+        }
+    }
+
+    // -- abilities ---------------------------------------------------------
+
+    /**
+     * Fires one of the four, if its clock has run out. Authority only: the
+     * host and a local match run this, the guest asks and waits to be told.
+     * `aim` overrides the direction, which is how the AI points them.
+     */
+    private castAbility (bey: Bey, index: number, aim?: PMath.Vector2): boolean
+    {
+        if (this.netRole === 'guest') return false;
+        if (index < 0 || index >= ABILITY_COUNT) return false;
+        if (this.phase !== 'battle' && this.phase !== 'special') return false;
+        if (!bey.alive || bey.cooldowns[index] > 0) return false;
+
+        const foe = bey === this.player ? this.enemy : this.player;
+        const dir = aim
+            ? aim.clone()
+            : new PMath.Vector2(bey.vel.x, bey.vel.y);
+
+        // Standing still points it at the other top rather than nowhere.
+        if (dir.length() < 40)
+        {
+            dir.set(foe.pos.x - bey.pos.x, foe.pos.y - bey.pos.y);
+        }
+
+        if (dir.length() < 0.001) dir.set(1, 0);
+        dir.normalize();
+
+        bey.cooldowns[index] = ABILITIES[index].cooldown;
+
+        this.netEvent({
+            t: 'cast',
+            who: bey === this.player ? 'p' : 'e',
+            i: index,
+            dx: dir.x,
+            dy: dir.y
+        });
+
+        this.playAbility(bey, index, dir);
+
+        return true;
+    }
+
+    /**
+     * The effect itself. Runs on both browsers so the flash and the noise are
+     * in both places, but only the side with authority spawns the things that
+     * carry on afterwards - those reach the guest in the snapshot instead.
+     */
+    private playAbility (bey: Bey, index: number, dir: PMath.Vector2): void
+    {
+        const def = ABILITIES[index];
+        const owner: 0 | 1 = bey === this.player ? 0 : 1;
+        const foe = bey === this.player ? this.enemy : this.player;
+        const angle = Math.atan2(dir.y, dir.x);
+        const simulate = this.netRole !== 'guest';
+
+        switch (def.id)
+        {
+            case 'saw':
+                if (simulate)
+                {
+                    this.spawnFx(
+                        'saw', owner,
+                        bey.pos.x + dir.x * (bey.radius + 8),
+                        bey.pos.y + dir.y * (bey.radius + 8),
+                        dir.x * SAW_SPEED, dir.y * SAW_SPEED,
+                        SAW_LIFE, angle
+                    );
+                }
+
+                // Throwing it shoves you back a little.
+                bey.vel.x -= dir.x * 130;
+                bey.vel.y -= dir.y * 130;
+                sfx.sawShot();
+                break;
+
+            case 'slash':
+                this.slashes.push({ bey, angle, at: this.time.now });
+                sfx.slash();
+                this.cameras.main.shake(120, 0.008);
+
+                for (let i = 0; i < 12; i++)
+                {
+                    const a = angle + PMath.FloatBetween(-SLASH_ARC / 2, SLASH_ARC / 2);
+                    const r = PMath.FloatBetween(bey.radius, SLASH_RANGE);
+                    this.sparks.emitParticleAt(
+                        bey.pos.x + Math.cos(a) * r,
+                        bey.pos.y + Math.sin(a) * r,
+                        1
+                    );
+                }
+
+                if (simulate) this.applySlash(bey, foe, angle);
+                break;
+
+            case 'vortex':
+                if (simulate)
+                {
+                    // Thrown out in front, then dragged back inside the wall so
+                    // the well never hangs half off the floor.
+                    const spot = new PMath.Vector2(
+                        bey.pos.x + dir.x * VORTEX_THROW,
+                        bey.pos.y + dir.y * VORTEX_THROW
+                    );
+                    const out = Math.hypot(spot.x - ARENA_X, spot.y - ARENA_Y);
+                    const room = ARENA_R - VORTEX_RADIUS * 0.85;
+
+                    if (out > room)
+                    {
+                        spot.set(
+                            ARENA_X + (spot.x - ARENA_X) / out * room,
+                            ARENA_Y + (spot.y - ARENA_Y) / out * room
+                        );
+                    }
+
+                    this.spawnFx('vortex', owner, spot.x, spot.y, 0, 0, VORTEX_LIFE, angle);
+                }
+
+                sfx.vortex();
+                break;
+
+            case 'repulse':
+                this.rings.push({ x: bey.pos.x, y: bey.pos.y, at: this.time.now, color: def.color });
+                bey.slowFree = REPULSE_FREE;
+                sfx.repulse();
+                this.cameras.main.shake(180, 0.012);
+                this.sparks.emitParticleAt(bey.pos.x, bey.pos.y, 22);
+
+                if (simulate) this.applyRepulse(bey, foe);
+                break;
+        }
+    }
+
+    private spawnFx (
+        kind: AbilityId,
+        owner: 0 | 1,
+        x: number, y: number,
+        vx: number, vy: number,
+        life: number,
+        angle: number
+    ): void
+    {
+        this.fx.push({
+            id: this.fxSeq++,
+            kind, owner, x, y, vx, vy,
+            life,
+            maxLife: life,
+            bounces: SAW_BOUNCES,
+            angle
+        });
+    }
+
+    /** A swing only lands inside the wedge it was aimed at. */
+    private applySlash (bey: Bey, foe: Bey, angle: number): void
+    {
+        if (!foe.alive) return;
+
+        const dx = foe.pos.x - bey.pos.x;
+        const dy = foe.pos.y - bey.pos.y;
+        const dist = Math.hypot(dx, dy);
+
+        if (dist > SLASH_RANGE + foe.radius) return;
+        if (Math.abs(PMath.Angle.Wrap(Math.atan2(dy, dx) - angle)) > SLASH_ARC / 2) return;
+
+        const nx = dist > 0.001 ? dx / dist : Math.cos(angle);
+        const ny = dist > 0.001 ? dy / dist : Math.sin(angle);
+
+        foe.vel.set(nx * SLASH_KNOCK, ny * SLASH_KNOCK);
+        foe.tumble = Math.max(foe.tumble, SLASH_TUMBLE);
+        foe.damage(SLASH_DAMAGE);
+        foe.hitFlash = 1;
+
+        this.hitStop = Math.max(this.hitStop, 0.05);
+        this.sparks.emitParticleAt(foe.pos.x, foe.pos.y, 24);
+        this.cameras.main.shake(200, 0.016);
+        sfx.hit(0.8);
+    }
+
+    /** The ring shoves the other top away and swats projectiles out of the air. */
+    private applyRepulse (bey: Bey, foe: Bey): void
+    {
+        for (const fx of this.fx)
+        {
+            if (fx.kind !== 'saw') continue;
+            if (Math.hypot(fx.x - bey.pos.x, fx.y - bey.pos.y) > REPULSE_RADIUS) continue;
+
+            fx.life = 0;
+            this.sparks.emitParticleAt(fx.x, fx.y, 10);
+        }
+
+        if (!foe.alive) return;
+
+        const dx = foe.pos.x - bey.pos.x;
+        const dy = foe.pos.y - bey.pos.y;
+        const dist = Math.hypot(dx, dy) || 1;
+        const reach = REPULSE_RADIUS + foe.radius;
+
+        if (dist > reach) return;
+
+        // Hardest right on top of the caster, still meaningful at the rim.
+        const falloff = 1 - PMath.Clamp(dist / reach, 0, 1) * 0.55;
+
+        foe.vel.set((dx / dist) * REPULSE_KNOCK * falloff, (dy / dist) * REPULSE_KNOCK * falloff);
+        foe.tumble = Math.max(foe.tumble, 0.3);
+        foe.damage(REPULSE_DAMAGE * falloff);
+        foe.hitFlash = 1;
+        sfx.wall(0.7);
+    }
+
+    private updateFx (dt: number): void
+    {
+        const guest = this.netRole === 'guest';
+
+        for (let i = this.fx.length - 1; i >= 0; i--)
+        {
+            const fx = this.fx[i];
+            fx.life -= dt;
+
+            if (fx.kind === 'saw')
+            {
+                // The guest dead-reckons between snapshots and leaves the
+                // ricochets and the hits to the host.
+                fx.x += fx.vx * dt;
+                fx.y += fx.vy * dt;
+                fx.angle += dt * 26;
+
+                if (!guest)
+                {
+                    this.bounceSaw(fx);
+                    this.sawHits(fx);
+                }
+            }
+            else if (fx.kind === 'vortex')
+            {
+                // Both sides pull, so the guest's own top does not lag behind
+                // its correction while it is being dragged in.
+                this.pullIntoVortex(fx, dt, guest);
+            }
+
+            if (fx.life <= 0) this.fx.splice(i, 1);
+        }
+    }
+
+    private bounceSaw (fx: Fx): void
+    {
+        const dx = fx.x - ARENA_X;
+        const dy = fx.y - ARENA_Y;
+        const dist = Math.hypot(dx, dy) || 1;
+        const limit = ARENA_R - SAW_RADIUS;
+
+        if (dist > limit)
+        {
+            // Out through a mouth, or out of bounces: gone either way.
+            if (isInGap(Math.atan2(dy, dx)) || fx.bounces <= 0)
+            {
+                fx.life = 0;
+                return;
+            }
+
+            const nx = dx / dist;
+            const ny = dy / dist;
+            const out = fx.vx * nx + fx.vy * ny;
+
+            fx.x = ARENA_X + nx * limit;
+            fx.y = ARENA_Y + ny * limit;
+            fx.vx -= 2 * out * nx;
+            fx.vy -= 2 * out * ny;
+            fx.bounces--;
+
+            this.sparks.emitParticleAt(fx.x, fx.y, 5);
+            sfx.wall(0.32);
+        }
+
+        for (const post of this.layout.bumpers)
+        {
+            const px = fx.x - post.x;
+            const py = fx.y - post.y;
+            const d = Math.hypot(px, py) || 1;
+            const min = post.radius + SAW_RADIUS;
+
+            if (d >= min) continue;
+
+            if (fx.bounces <= 0)
+            {
+                fx.life = 0;
+                return;
+            }
+
+            const nx = px / d;
+            const ny = py / d;
+            const out = fx.vx * nx + fx.vy * ny;
+
+            fx.x = post.x + nx * min;
+            fx.y = post.y + ny * min;
+            fx.vx -= 2 * out * nx;
+            fx.vy -= 2 * out * ny;
+            fx.bounces--;
+
+            sfx.bumper();
+            this.sparks.emitParticleAt(fx.x, fx.y, 7);
+        }
+    }
+
+    private sawHits (fx: Fx): void
+    {
+        const target = fx.owner === 0 ? this.enemy : this.player;
+
+        if (!target.alive) return;
+
+        const dx = target.pos.x - fx.x;
+        const dy = target.pos.y - fx.y;
+        const dist = Math.hypot(dx, dy);
+
+        if (dist > target.radius + SAW_RADIUS) return;
+
+        const nx = dist > 0.001 ? dx / dist : 1;
+        const ny = dist > 0.001 ? dy / dist : 0;
+
+        target.vel.x += nx * SAW_KNOCK;
+        target.vel.y += ny * SAW_KNOCK;
+        target.damage(SAW_DAMAGE);
+        target.hitFlash = 1;
+        fx.life = 0;
+
+        sfx.hit(0.55);
+        this.sparks.emitParticleAt(fx.x, fx.y, 18);
+        this.cameras.main.shake(140, 0.008);
+    }
+
+    private pullIntoVortex (fx: Fx, dt: number, guest: boolean): void
+    {
+        const target = fx.owner === 0 ? this.enemy : this.player;
+
+        // A rail owns the tip outright, and a special dash is too committed.
+        if (!target.alive || target.onRail || target.special > 0) return;
+
+        const dx = fx.x - target.pos.x;
+        const dy = fx.y - target.pos.y;
+        const d = Math.hypot(dx, dy);
+
+        if (d > VORTEX_RADIUS || d < 1) return;
+
+        const grip = 1 - d / VORTEX_RADIUS;
+
+        target.vel.x += (dx / d) * VORTEX_PULL * grip * dt;
+        target.vel.y += (dy / d) * VORTEX_PULL * grip * dt;
+
+        if (!guest) target.damage(VORTEX_DAMAGE * grip * dt);
+    }
+
+    /** Wipes the floor before a cinematic takes the stage. */
+    private clearFx (): void
+    {
+        this.fx = [];
+        this.slashes = [];
+        this.rings = [];
+        this.fxLayer.clear();
+    }
+
+    private drawFx (): void
+    {
+        const g = this.fxLayer;
+        g.clear();
+
+        for (const fx of this.fx)
+        {
+            const color = fx.owner === 0 ? this.player.color : this.enemy.color;
+
+            if (fx.kind === 'saw')
+            {
+                g.fillStyle(0x0a121c, 0.9);
+                g.fillCircle(fx.x, fx.y, SAW_RADIUS + 2);
+                g.fillStyle(color, 1);
+                g.fillCircle(fx.x, fx.y, SAW_RADIUS * 0.55);
+
+                g.lineStyle(3, 0xffe066, 0.95);
+                for (let i = 0; i < 6; i++)
+                {
+                    const a = fx.angle + (i / 6) * Math.PI * 2;
+                    g.lineBetween(
+                        fx.x + Math.cos(a) * SAW_RADIUS * 0.5,
+                        fx.y + Math.sin(a) * SAW_RADIUS * 0.5,
+                        fx.x + Math.cos(a) * SAW_RADIUS,
+                        fx.y + Math.sin(a) * SAW_RADIUS
+                    );
+                }
+
+                g.lineStyle(2, 0xffffff, 0.5);
+                g.strokeCircle(fx.x, fx.y, SAW_RADIUS);
+                continue;
+            }
+
+            // The well: arms winding inwards, tightening as it ages.
+            const t = 1 - fx.life / fx.maxLife;
+            const swirl = this.time.now / 140;
+
+            g.fillStyle(0x120a20, 0.5);
+            g.fillCircle(fx.x, fx.y, VORTEX_RADIUS * 0.42);
+
+            for (let arm = 0; arm < 3; arm++)
+            {
+                g.lineStyle(3, 0x9d7bff, 0.45 * (1 - t * 0.4));
+                g.beginPath();
+
+                for (let k = 0; k <= 14; k++)
+                {
+                    const f = k / 14;
+                    const r = VORTEX_RADIUS * (0.12 + f * 0.88);
+                    const a = swirl + (arm / 3) * Math.PI * 2 + f * 2.4;
+                    const x = fx.x + Math.cos(a) * r;
+                    const y = fx.y + Math.sin(a) * r;
+
+                    if (k === 0) g.moveTo(x, y);
+                    else g.lineTo(x, y);
+                }
+
+                g.strokePath();
+            }
+
+            g.lineStyle(3, 0x9d7bff, 0.35);
+            g.strokeCircle(fx.x, fx.y, VORTEX_RADIUS);
+        }
+
+        this.slashes = this.slashes.filter((s) => this.time.now - s.at < SLASH_LIFE * 1000);
+
+        for (const swing of this.slashes)
+        {
+            const age = (this.time.now - swing.at) / (SLASH_LIFE * 1000);
+            const reach = SLASH_RANGE * (0.5 + 0.5 * age);
+            const a0 = swing.angle - SLASH_ARC / 2;
+            const a1 = swing.angle + SLASH_ARC / 2;
+
+            g.lineStyle(15 * (1 - age), 0xff7ad9, 0.85 * (1 - age));
+            g.beginPath();
+            g.arc(swing.bey.pos.x, swing.bey.pos.y, reach, a0, a1, false);
+            g.strokePath();
+
+            g.lineStyle(4 * (1 - age), 0xffffff, 0.9 * (1 - age));
+            g.beginPath();
+            g.arc(swing.bey.pos.x, swing.bey.pos.y, reach * 0.72, a0, a1, false);
+            g.strokePath();
+        }
+
+        this.rings = this.rings.filter((r) => this.time.now - r.at < REPULSE_LIFE * 1000);
+
+        for (const ring of this.rings)
+        {
+            const age = (this.time.now - ring.at) / (REPULSE_LIFE * 1000);
+
+            g.lineStyle(16 * (1 - age), ring.color, 0.9 * (1 - age));
+            g.strokeCircle(ring.x, ring.y, REPULSE_RADIUS * age);
+            g.lineStyle(4 * (1 - age), 0xffffff, 0.8 * (1 - age));
+            g.strokeCircle(ring.x, ring.y, REPULSE_RADIUS * age * 0.7);
         }
     }
 
@@ -633,6 +1157,18 @@ export class Game extends Scene
             return;
         }
 
+        // Abilities, picked for the range it finds itself at.
+        if (this.phase === 'battle' && Math.random() < 0.055)
+        {
+            const at = new PMath.Vector2(p.pos.x - ai.pos.x, p.pos.y - ai.pos.y);
+
+            if (dist < 200) this.castAbility(ai, 1, at);
+            else if (dist > 300) this.castAbility(ai, 0, at);
+            else if (dist > 220) this.castAbility(ai, 2, at);
+
+            if (dist < 230) this.castAbility(ai, 3, at);
+        }
+
         if (!this.aiAggressive)
         {
             // Orbit the centre: perpendicular to the player direction, biased away.
@@ -650,7 +1186,7 @@ export class Game extends Scene
         if (fromCenter > ARENA_R * 0.7)
         {
             // Push harder when the drift is towards one of the open mouths.
-            const danger = this.isInGap(Math.atan2(cy, cx)) ? 3.2 : 1.6;
+            const danger = isInGap(Math.atan2(cy, cx)) ? 3.2 : 1.6;
             const w = (fromCenter - ARENA_R * 0.7) / (ARENA_R * 0.3);
             dx -= (cx / fromCenter) * w * danger;
             dy -= (cy / fromCenter) * w * danger;
@@ -985,17 +1521,6 @@ export class Game extends Scene
 
     // -- physics ----------------------------------------------------------
 
-    /** True inside one of the two open mouths of the stadium. */
-    private isInGap (angle: number): boolean
-    {
-        for (const gap of GAP_ANGLES)
-        {
-            if (Math.abs(PMath.Angle.Wrap(angle - gap)) < GAP_HALF) return true;
-        }
-
-        return false;
-    }
-
     private collideWithWall (bey: Bey): void
     {
         if (bey.ringOut || bey.onRail) return;
@@ -1005,7 +1530,7 @@ export class Game extends Scene
         const dist = Math.hypot(dx, dy);
         const nx = dx / dist;
         const ny = dy / dist;
-        const inGap = this.isInGap(Math.atan2(dy, dx));
+        const inGap = isInGap(Math.atan2(dy, dx));
 
         const limit = ARENA_R - bey.radius;
 
@@ -1080,20 +1605,81 @@ export class Game extends Scene
         }
     }
 
-    // -- rails ------------------------------------------------------------
+    // -- pinball furniture --------------------------------------------------
 
-    private buildRails (): Rail[]
+    /**
+     * The posts, the pads and the sludge. Posts throw a top straight back out
+     * with a fixed kick, so even a lazy roll into one turns into a ricochet;
+     * pads run a current across the floor; sludge kills speed on contact.
+     */
+    private collideObstacles (bey: Bey, dt: number): void
     {
-        // One rail per side, each pointing straight at the middle of the floor.
-        return [0, Math.PI].map((angle) => ({
-            start: new PMath.Vector2(
-                ARENA_X + Math.cos(angle) * (ARENA_R - 14),
-                ARENA_Y + Math.sin(angle) * (ARENA_R - 14)
-            ),
-            dir: new PMath.Vector2(-Math.cos(angle), -Math.sin(angle)),
-            length: RAIL_LENGTH
-        }));
+        if (!bey.alive || bey.onRail || bey.ringOut) return;
+
+        for (let i = 0; i < this.layout.bumpers.length; i++)
+        {
+            const post = this.layout.bumpers[i];
+            const dx = bey.pos.x - post.x;
+            const dy = bey.pos.y - post.y;
+            const dist = Math.hypot(dx, dy) || 1;
+            const minDist = post.radius + bey.radius;
+
+            if (dist >= minDist) continue;
+
+            const nx = dx / dist;
+            const ny = dy / dist;
+
+            bey.pos.set(post.x + nx * minDist, post.y + ny * minDist);
+
+            const inward = bey.vel.x * nx + bey.vel.y * ny;
+
+            if (inward < 0)
+            {
+                bey.vel.x -= 1.6 * inward * nx;
+                bey.vel.y -= 1.6 * inward * ny;
+            }
+
+            // The kick is what makes it a pinball post rather than a rock: the
+            // top leaves faster than it arrived, however slowly it crept in.
+            bey.vel.x += nx * post.kick;
+            bey.vel.y += ny * post.kick;
+
+            bey.damage(1.6);
+            bey.hitFlash = Math.max(bey.hitFlash, 0.6);
+
+            this.bumperHits.set(i, this.time.now);
+            this.sparks.emitParticleAt(post.x + nx * post.radius, post.y + ny * post.radius, 10);
+            sfx.bumper();
+            this.cameras.main.shake(90, 0.005);
+        }
+
+        for (const pad of this.layout.pushers)
+        {
+            const d = Math.hypot(bey.pos.x - pad.x, bey.pos.y - pad.y);
+
+            if (d > pad.radius + bey.radius) continue;
+
+            bey.vel.x += pad.dx * pad.force * dt;
+            bey.vel.y += pad.dy * pad.force * dt;
+        }
+
+        // A special dash ploughs straight through, and the repulsor buys a
+        // couple of seconds of the same.
+        if (bey.slowFree > 0 || bey.special > 0) return;
+
+        for (const zone of this.layout.slows)
+        {
+            const d = Math.hypot(bey.pos.x - zone.x, bey.pos.y - zone.y);
+            const reach = zone.radius + bey.radius;
+
+            if (d > reach) continue;
+
+            const bite = PMath.Clamp(1 - d / reach, 0, 1);
+            bey.vel.scale(Math.max(0, 1 - zone.drag * bite * dt));
+        }
     }
+
+    // -- rails ------------------------------------------------------------
 
     /** Entry point of whichever rail is closest, used by the AI. */
     private nearestRailMouth (from: PMath.Vector2): PMath.Vector2
@@ -1103,7 +1689,8 @@ export class Game extends Scene
 
         for (const rail of this.rails)
         {
-            const d = PMath.Distance.Between(from.x, from.y, rail.start.x, rail.start.y);
+            const mouth = railMouth(rail, 0);
+            const d = PMath.Distance.Between(from.x, from.y, mouth.x, mouth.y);
             if (d < bestDist)
             {
                 bestDist = d;
@@ -1111,10 +1698,7 @@ export class Game extends Scene
             }
         }
 
-        return new PMath.Vector2(
-            best.start.x + best.dir.x * 18,
-            best.start.y + best.dir.y * 18
-        );
+        return railMouth(best);
     }
 
     /**
@@ -1135,11 +1719,11 @@ export class Game extends Scene
                 ride.speed = Math.min(RAIL_TOP_SPEED, ride.speed + RAIL_ACCEL * dt);
                 ride.progress += ride.speed * dt;
 
-                bey.pos.set(
-                    ride.rail.start.x + ride.rail.dir.x * ride.progress,
-                    ride.rail.start.y + ride.rail.dir.y * ride.progress
-                );
-                bey.vel.set(ride.rail.dir.x * ride.speed, ride.rail.dir.y * ride.speed);
+                const at = railPoint(ride.rail, ride.progress);
+                const along = railTangent(ride.rail, ride.progress);
+
+                bey.pos.set(at.x, at.y);
+                bey.vel.set(along.x * ride.speed, along.y * ride.speed);
 
                 if (this.railTrail <= 0)
                 {
@@ -1158,16 +1742,13 @@ export class Game extends Scene
 
             for (const rail of this.rails)
             {
-                const relX = bey.pos.x - rail.start.x;
-                const relY = bey.pos.y - rail.start.y;
-                const along = relX * rail.dir.x + relY * rail.dir.y;
-                const lateral = Math.abs(relX * -rail.dir.y + relY * rail.dir.x);
+                const { d, dist } = railProject(rail, bey.pos.x, bey.pos.y);
 
                 // Only the mouth end grabs, so a top crossing the middle of the
                 // floor is not yanked sideways out of nowhere.
-                if (along > -30 && along < RAIL_MOUTH && lateral < RAIL_CAPTURE_WIDTH)
+                if (d > -30 && d < RAIL_MOUTH && dist < RAIL_CAPTURE_WIDTH)
                 {
-                    this.captureOnRail(bey, rail, Math.max(0, along));
+                    this.captureOnRail(bey, rail, Math.max(0, d));
                     break;
                 }
             }
@@ -1195,10 +1776,12 @@ export class Game extends Scene
 
         this.rides.delete(bey);
 
+        const along = railTangent(ride.rail, Math.min(ride.progress, ride.rail.length));
+
         bey.onRail = false;
         bey.boost = RAIL_BOOST_TIME;
         bey.railCooldown = 1;
-        bey.vel.set(ride.rail.dir.x * ride.speed, ride.rail.dir.y * ride.speed);
+        bey.vel.set(along.x * ride.speed, along.y * ride.speed);
 
         sfx.railLaunch();
         this.cameras.main.shake(160, 0.008);
@@ -1505,6 +2088,7 @@ export class Game extends Scene
         this.duelHits = [];
         this.duelCounterRolled = true;
         this.remoteMashes = 0;
+        this.clearFx();
 
         this.netEvent({ t: 'duel' });
 
@@ -1843,6 +2427,7 @@ export class Game extends Scene
         });
 
         this.phase = 'clash';
+        this.clearFx();
         this.clashWinner = winner;
         this.clashLoser = loser;
         this.clashTimer = 0;
@@ -2151,10 +2736,67 @@ export class Game extends Scene
         }
 
         this.drawGaps(g);
+        this.drawObstacles(g);
 
         for (const rail of this.rails)
         {
             this.drawRail(g, rail);
+        }
+    }
+
+    /** The pinball furniture: sludge on the floor, then pads, then posts. */
+    private drawObstacles (g: GameObjects.Graphics): void
+    {
+        for (const zone of this.layout.slows)
+        {
+            g.fillStyle(0x1d2b1f, 0.95);
+            g.fillCircle(zone.x, zone.y, zone.radius);
+
+            g.lineStyle(2, 0x6f8f3f, 0.3);
+            for (let i = 1; i < 5; i++)
+            {
+                g.strokeCircle(zone.x, zone.y, zone.radius * (i / 5));
+            }
+
+            g.lineStyle(3, 0x6f8f3f, 0.75);
+            g.strokeCircle(zone.x, zone.y, zone.radius);
+        }
+
+        for (const pad of this.layout.pushers)
+        {
+            g.fillStyle(0x10202c, 0.95);
+            g.fillCircle(pad.x, pad.y, pad.radius);
+            g.lineStyle(3, 0x2ee6ff, 0.5);
+            g.strokeCircle(pad.x, pad.y, pad.radius);
+
+            // Chevrons pointing the way it shoves.
+            const px = -pad.dy;
+            const py = pad.dx;
+
+            g.lineStyle(4, 0x2ee6ff, 0.8);
+            for (let k = 0; k < 3; k++)
+            {
+                const o = -30 + k * 28;
+                const tipX = pad.x + pad.dx * (o + 20);
+                const tipY = pad.y + pad.dy * (o + 20);
+
+                g.lineBetween(pad.x + pad.dx * o + px * 22, pad.y + pad.dy * o + py * 22, tipX, tipY);
+                g.lineBetween(pad.x + pad.dx * o - px * 22, pad.y + pad.dy * o - py * 22, tipX, tipY);
+            }
+        }
+
+        for (const post of this.layout.bumpers)
+        {
+            g.fillStyle(0x0a121c, 0.9);
+            g.fillCircle(post.x, post.y, post.radius + 7);
+            g.fillStyle(0xff8a3c, 1);
+            g.fillCircle(post.x, post.y, post.radius);
+            g.fillStyle(0xffd166, 1);
+            g.fillCircle(post.x, post.y, post.radius * 0.62);
+            g.fillStyle(0xffffff, 0.9);
+            g.fillCircle(post.x - post.radius * 0.18, post.y - post.radius * 0.2, post.radius * 0.22);
+            g.lineStyle(3, 0x1a2c3d, 0.9);
+            g.strokeCircle(post.x, post.y, post.radius);
         }
     }
 
@@ -2204,55 +2846,63 @@ export class Game extends Scene
         }
     }
 
-    /** A toothed rail: the tip meshes with these and gets flung inwards. */
+    /**
+     * A toothed rail, drawn by walking it. Straight or curved makes no odds:
+     * both are a point and a tangent at every step along the way.
+     */
     private drawRail (g: GameObjects.Graphics, rail: Rail): void
     {
-        const { start, dir, length } = rail;
-        const px = -dir.y;
-        const py = dir.x;
         const wide = 19;
         const narrow = 12;
+        const step = 9;
 
-        const widthAt = (d: number) => wide - (d / length) * (wide - narrow);
+        const left: [number, number][] = [];
+        const right: [number, number][] = [];
+        const at = new PMath.Vector2();
+        const along = new PMath.Vector2();
+
+        for (let d = 0; d <= rail.length; d += step)
+        {
+            railPoint(rail, d, at);
+            railTangent(rail, d, along);
+
+            const w = wide - (d / rail.length) * (wide - narrow);
+
+            left.push([at.x - along.y * w, at.y + along.x * w]);
+            right.push([at.x + along.y * w, at.y - along.x * w]);
+        }
 
         // Bed.
         g.fillStyle(0x0e1a26, 1);
         g.beginPath();
-        g.moveTo(start.x + px * wide, start.y + py * wide);
-        g.lineTo(start.x - px * wide, start.y - py * wide);
-        g.lineTo(start.x + dir.x * length - px * narrow, start.y + dir.y * length - py * narrow);
-        g.lineTo(start.x + dir.x * length + px * narrow, start.y + dir.y * length + py * narrow);
+        g.moveTo(left[0][0], left[0][1]);
+        for (const q of left) g.lineTo(q[0], q[1]);
+        for (let i = right.length - 1; i >= 0; i--) g.lineTo(right[i][0], right[i][1]);
         g.closePath();
         g.fillPath();
 
         // Teeth.
         g.lineStyle(2, 0x49d17a, 0.8);
-        for (let d = 0; d <= length; d += 11)
+        for (let i = 0; i < left.length; i++)
         {
-            const w = widthAt(d);
-            g.lineBetween(
-                start.x + dir.x * d + px * w,
-                start.y + dir.y * d + py * w,
-                start.x + dir.x * d - px * w,
-                start.y + dir.y * d - py * w
-            );
+            if (i % 2) continue;
+            g.lineBetween(left[i][0], left[i][1], right[i][0], right[i][1]);
         }
 
         // Guide edges.
         g.lineStyle(3, 0x49d17a, 0.95);
-        for (const side of [-1, 1])
+        for (const edge of [left, right])
         {
-            g.lineBetween(
-                start.x + px * wide * side,
-                start.y + py * wide * side,
-                start.x + dir.x * length + px * narrow * side,
-                start.y + dir.y * length + py * narrow * side
-            );
+            g.beginPath();
+            g.moveTo(edge[0][0], edge[0][1]);
+            for (const q of edge) g.lineTo(q[0], q[1]);
+            g.strokePath();
         }
 
-        // Exit marker at the inner end.
+        // Exit marker at the far end.
+        railPoint(rail, rail.length, at);
         g.lineStyle(3, 0x49d17a, 0.5);
-        g.strokeCircle(start.x + dir.x * length, start.y + dir.y * length, 10);
+        g.strokeCircle(at.x, at.y, 10);
     }
 
     /** Lights up a rail while a top is riding it. */
@@ -2261,18 +2911,45 @@ export class Game extends Scene
         const g = this.railGlow;
         g.clear();
 
+        const at = new PMath.Vector2();
+
         for (const [bey, ride] of this.rides)
         {
-            const { start, dir, length } = ride.rail;
+            const rail = ride.rail;
             const pulse = 0.45 + 0.35 * Math.sin(this.time.now / 45);
 
             g.lineStyle(10, bey.color, pulse * 0.55);
-            g.lineBetween(start.x, start.y, start.x + dir.x * length, start.y + dir.y * length);
+            g.beginPath();
+            railPoint(rail, 0, at);
+            g.moveTo(at.x, at.y);
+            for (let d = 12; d <= rail.length; d += 12)
+            {
+                railPoint(rail, d, at);
+                g.lineTo(at.x, at.y);
+            }
+            g.strokePath();
 
             // Head of the charge running along the teeth.
-            const t = Math.min(1, ride.progress / length);
+            railPoint(rail, Math.min(ride.progress, rail.length), at);
             g.fillStyle(0xffffff, 0.85);
-            g.fillCircle(start.x + dir.x * length * t, start.y + dir.y * length * t, 7);
+            g.fillCircle(at.x, at.y, 7);
+        }
+
+        // Posts light up for a moment after they throw someone.
+        for (const [index, at] of this.bumperHits)
+        {
+            const age = (this.time.now - at) / 260;
+
+            if (age >= 1)
+            {
+                this.bumperHits.delete(index);
+                continue;
+            }
+
+            const post = this.layout.bumpers[index];
+
+            g.lineStyle(7 * (1 - age), 0xffe066, 1 - age);
+            g.strokeCircle(post.x, post.y, post.radius + 6 + age * 44);
         }
     }
 
@@ -2282,7 +2959,7 @@ export class Game extends Scene
         g.clear();
 
         this.drawBar(g, 40, 34, this.player, 0x2ee6ff, false);
-        this.drawBar(g, 1024 - 40 - 360, 34, this.enemy, 0xff4d5a, true);
+        this.drawBar(g, VIEW_W - 40 - 360, 34, this.enemy, 0xff4d5a, true);
     }
 
     private drawBar (
@@ -2298,7 +2975,7 @@ export class Game extends Scene
         const h = 26;
 
         g.fillStyle(0x000000, 0.55);
-        g.fillRoundedRect(x - 3, y - 3, w + 6, h + 26, 6);
+        g.fillRoundedRect(x - 3, y - 3, w + 6, h + 72, 6);
 
         g.fillStyle(0x22303c, 1);
         g.fillRect(x, y, w, h);
@@ -2337,11 +3014,47 @@ export class Game extends Scene
             g.fillRect(x, my, meterFill, mh);
         }
 
-        // Dash cooldown pip.
+        // Ability pips: one square per key, refilling as the clock runs out.
+        const size = 26;
+        const pad = 8;
+        const row = ABILITY_COUNT * size + (ABILITY_COUNT - 1) * pad;
+        const bx = rightAligned ? x + w - row : x;
+        const by = my + mh + 8;
+
+        for (let i = 0; i < ABILITY_COUNT; i++)
+        {
+            const def = ABILITIES[i];
+            const px = bx + i * (size + pad);
+            const left = bey.cooldowns[i] / def.cooldown;
+            const armed = bey.cooldowns[i] <= 0;
+
+            g.fillStyle(0x101a24, 1);
+            g.fillRoundedRect(px, by, size, size, 5);
+            g.fillStyle(def.color, armed ? 0.9 : 0.16);
+            g.fillRoundedRect(px + 2, by + 2, size - 4, size - 4, 4);
+
+            if (!armed)
+            {
+                // Fills back up from the bottom as it comes off cooldown.
+                const grown = (size - 4) * (1 - left);
+                g.fillStyle(def.color, 0.5);
+                g.fillRect(px + 2, by + size - 2 - grown, size - 4, grown);
+            }
+
+            g.lineStyle(2, armed ? 0xffffff : 0x44525e, armed ? 0.8 : 0.5);
+            g.strokeRoundedRect(px, by, size, size, 5);
+
+            // The digits only go on the side this browser is playing.
+            if (bey === this.local)
+            {
+                this.abilityKeys[i].setPosition(px + size / 2, by + size / 2);
+            }
+        }
+
+        // Dash cooldown pip, sitting at the end of the row.
         const ready = bey.dashCooldown <= 0 && bey.spin >= 8;
         g.fillStyle(ready ? color : 0x44525e, 1);
-        const pipX = rightAligned ? x + w - 10 : x + 10;
-        g.fillCircle(pipX, my + mh + 12, 6);
+        g.fillCircle(rightAligned ? bx - pad - 9 : bx + row + pad + 9, by + size / 2, 9);
     }
 
     // -- online play ------------------------------------------------------
@@ -2436,11 +3149,13 @@ export class Game extends Scene
             x: this.pendingInput.dx,
             y: this.pendingInput.dy,
             d: this.pendingInput.dash,
-            s: this.pendingInput.special
+            s: this.pendingInput.special,
+            a: this.pendingInput.ability
         });
 
         this.pendingInput.dash = false;
         this.pendingInput.special = false;
+        this.pendingInput.ability = -1;
         this.lastInputAt = this.time.now;
     }
 
@@ -2479,8 +3194,80 @@ export class Game extends Scene
             p: this.beyState(this.player),
             e: this.beyState(this.enemy),
             dp: this.duelPlayer,
-            de: this.duelEnemy
+            de: this.duelEnemy,
+            fx: this.fxState(),
+            cd: [...this.player.cooldowns, ...this.enemy.cooldowns].map(
+                (v) => Math.round(v * 100) / 100
+            )
         };
+    }
+
+    /** The saws and wells still on the floor, small enough to ship at 30 Hz. */
+    private fxState (): number[][]
+    {
+        return this.fx
+            .filter((fx) => isPersistent(fx.kind))
+            .map((fx) => [
+                fx.id,
+                KIND_ORDER.indexOf(fx.kind),
+                fx.owner,
+                Math.round(fx.x),
+                Math.round(fx.y),
+                Math.round(fx.vx),
+                Math.round(fx.vy),
+                Math.round(fx.life * 100) / 100,
+                Math.round(fx.maxLife * 100) / 100
+            ]);
+    }
+
+    /**
+     * The guest's copy of what is on the floor. Matched by id so a saw keeps
+     * its identity between snapshots and can be eased across rather than
+     * teleporting thirty times a second.
+     */
+    private applyFxState (rows: number[][]): void
+    {
+        const seen = new Set<number>();
+
+        for (const row of rows)
+        {
+            const [id, kind, owner, x, y, vx, vy, life, maxLife] = row;
+
+            seen.add(id);
+
+            let fx = this.fx.find((candidate) => candidate.id === id);
+
+            if (!fx)
+            {
+                fx = {
+                    id,
+                    kind: KIND_ORDER[kind],
+                    owner: owner as 0 | 1,
+                    x, y, vx, vy,
+                    life,
+                    maxLife,
+                    bounces: 0,
+                    angle: 0
+                };
+
+                this.fx.push(fx);
+            }
+            else
+            {
+                fx.x = PMath.Linear(fx.x, x, 0.6);
+                fx.y = PMath.Linear(fx.y, y, 0.6);
+            }
+
+            fx.vx = vx;
+            fx.vy = vy;
+            fx.life = life;
+            fx.maxLife = maxLife;
+        }
+
+        for (let i = this.fx.length - 1; i >= 0; i--)
+        {
+            if (!seen.has(this.fx[i].id)) this.fx.splice(i, 1);
+        }
     }
 
     /** Everything about a top the other side cannot work out for itself. */
@@ -2507,6 +3294,19 @@ export class Game extends Scene
     {
         this.applyBeyState(this.player, message.p as number[], this.player === this.local);
         this.applyBeyState(this.enemy, message.e as number[], this.enemy === this.local);
+
+        this.applyFxState((message.fx as number[][]) ?? []);
+
+        const cooldowns = message.cd as number[] | undefined;
+
+        if (cooldowns)
+        {
+            for (let i = 0; i < ABILITY_COUNT; i++)
+            {
+                this.player.cooldowns[i] = cooldowns[i];
+                this.enemy.cooldowns[i] = cooldowns[ABILITY_COUNT + i];
+            }
+        }
 
         if (this.phase === 'duel')
         {
@@ -2614,6 +3414,10 @@ export class Game extends Scene
                 this.remoteInput.dy = message.y as number;
                 if (message.d) this.remoteInput.dash = true;
                 if (message.s) this.remoteInput.special = true;
+                if (typeof message.a === 'number' && message.a >= 0)
+                {
+                    this.remoteInput.ability = message.a;
+                }
                 break;
 
             case 'mash':
@@ -2650,6 +3454,20 @@ export class Game extends Scene
                 this.startSpecial(
                     bey,
                     other(bey),
+                    new PMath.Vector2(message.dx as number, message.dy as number)
+                );
+                break;
+            }
+
+            case 'cast':
+            {
+                if (this.netRole !== 'guest') break;
+
+                const caster = side(message.who);
+
+                this.playAbility(
+                    caster,
+                    message.i as number,
                     new PMath.Vector2(message.dx as number, message.dy as number)
                 );
                 break;
@@ -2739,6 +3557,7 @@ export class Game extends Scene
 
         sfx.stopDrone();
         sfx.stopCharge();
+        this.clearFx();
         this.endSpecial();
         this.player.frozen = false;
         this.enemy.frozen = false;

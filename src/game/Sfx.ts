@@ -1365,6 +1365,49 @@ export class Sfx
     }
 
     /** The tip dropping into the rail teeth and spooling up. */
+    /** Pinball post: a sprung metal pop with a bell inside it. */
+    bumper (): void
+    {
+        this.burst({ duration: 0.06, volume: 0.5, type: 'bandpass', freqFrom: 2200, freqTo: 900, q: 3.5, attack: 0.0007, drive: 12 });
+        this.tone({ freq: 880, freqTo: 330, duration: 0.14, volume: 0.3, type: 'square', drive: 5 });
+        this.tone({ freq: 150, freqTo: 70, duration: 0.16, volume: 0.24, type: 'sine' });
+    }
+
+    /** A buzzsaw leaving the tip: whirr rising as it goes. */
+    sawShot (): void
+    {
+        this.burst({ duration: 0.28, volume: 0.32, type: 'bandpass', freqFrom: 900, freqTo: 2600, q: 2.2, attack: 0.004, drive: 8 });
+        this.tone({ freq: 260, freqTo: 900, duration: 0.26, volume: 0.18, type: 'sawtooth', drive: 7 });
+    }
+
+    /** Blade through the air, then the bite at the end of the swing. */
+    slash (): void
+    {
+        this.burst({ duration: 0.16, volume: 0.42, type: 'bandpass', freqFrom: 700, freqTo: 4200, q: 1.1, attack: 0.002, drive: 6 });
+        this.burst({ duration: 0.1, volume: 0.34, type: 'highpass', freqFrom: 3200, q: 0.8, delay: 0.08, attack: 0.001, drive: 12 });
+        this.tone({ freq: 1500, freqTo: 420, duration: 0.16, volume: 0.15, type: 'sawtooth', delay: 0.07, drive: 5 });
+    }
+
+    /** The well opening: everything sliding down into it. */
+    vortex (): void
+    {
+        this.tone({ freq: 420, freqTo: 60, duration: 0.9, volume: 0.26, type: 'sine', drive: 3 });
+        this.burst({ duration: 0.9, volume: 0.18, type: 'lowpass', freqFrom: 1800, freqTo: 200, q: 2.5, attack: 0.05 });
+
+        for (let i = 0; i < 5; i++)
+        {
+            this.tone({ freq: 300 - i * 40, freqTo: 90, duration: 0.35, volume: 0.07, type: 'triangle', delay: i * 0.09 });
+        }
+    }
+
+    /** The ring going off: a slam and the air leaving with it. */
+    repulse (): void
+    {
+        this.tone({ freq: 90, freqTo: 34, duration: 0.4, volume: 0.4, type: 'sine', drive: 4 });
+        this.burst({ duration: 0.34, volume: 0.4, type: 'bandpass', freqFrom: 3200, freqTo: 260, q: 0.8, attack: 0.001, drive: 10 });
+        this.tone({ freq: 620, freqTo: 180, duration: 0.24, volume: 0.18, type: 'square', drive: 6 });
+    }
+
     railEnter (): void
     {
         // The lock-in clack.
