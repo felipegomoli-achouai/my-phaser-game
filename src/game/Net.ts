@@ -318,7 +318,15 @@ class Net
 
         for (const handler of this.handlers)
         {
-            handler(message);
+            // One bad subscriber must not stop the packet reaching the rest.
+            try
+            {
+                handler(message);
+            }
+            catch (err)
+            {
+                console.error('[net] subscriber failed', err);
+            }
         }
     }
 

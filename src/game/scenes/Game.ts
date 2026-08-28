@@ -115,6 +115,8 @@ export class Game extends Scene
     private remoteMashes = 0;
     /** Seconds the guest has disagreed with the host about the phase. */
     private phaseDrift = 0;
+    /** Set while a rebuild is already on its way, so pings do not pile more up. */
+    private netResync = false;
 
     private phase: Phase = 'countdown';
     private countdown = 3;
@@ -178,6 +180,7 @@ export class Game extends Scene
         this.pendingInput = { dx: 0, dy: 0, dash: false, special: false };
         this.remoteMashes = 0;
         this.phaseDrift = 0;
+        this.netResync = false;
         this.hitStop = 0;
         this.lastBeep = 4;
         this.specialImpactTime = -9999;
@@ -318,7 +321,7 @@ export class Game extends Scene
         keyboard.on('keydown-R', () =>
         {
             // Only the host may restart, so the two never start out of step.
-            if (this.netRole === 'guest') net.send({ t: 'rq' });
+            if (net.role === 'guest') net.send({ t: 'rq' });
             else this.restartMatch();
         });
         keyboard.on('keydown-M', () =>
@@ -331,14 +334,29 @@ export class Game extends Scene
         this.input.on('pointerdown', () => sfx.unlock());
 
         this.netOff?.();
-        this.netOff = net.on((message) => this.onNetMessage(message));
+        this.netOff = net.on((message) => this.guarded(() => this.onNetMessage(message)));
 
-        this.events.once('shutdown', () =>
+        // Joining or leaving a room changes who drives which top, which is
+        // settled here in create(), so the match has to be rebuilt.
+        const onNetState = () => this.guarded(() => this.syncNetMode());
+        EventBus.on('net-state', onNetState);
+
+        // Both events matter: a restart shuts the scene down, but tearing the
+        // whole game down only destroys it, and a listener left behind on
+        // these module-wide singletons would outlive the scene it belongs to.
+        const release = () =>
         {
             sfx.stopAll();
             this.netOff?.();
             this.netOff = null;
-        });
+            EventBus.off('net-state', onNetState);
+        };
+
+        this.events.once('shutdown', release);
+        this.events.once('destroy', release);
+
+        // The connection may have come up while the scene was still building.
+        this.syncNetMode();
 
         if (DEBUG_FULL_METER && !this.netRole)
         {
@@ -2335,10 +2353,78 @@ export class Game extends Scene
         this.scene.restart();
     }
 
+    /**
+     * Brings the scene in line with the connection. The host rebuilds and tells
+     * the guest to do the same, which is exactly what pressing R does: one
+     * countdown, started once, so the two are never a beat apart.
+     */
+    /**
+     * True while Phaser still owns this instance. A scene that has been torn
+     * down keeps whatever it subscribed to the shared EventBus and to net, so
+     * every callback from outside the scene has to ask first.
+     */
+    private get attached (): boolean
+    {
+        return this.scene?.manager != null;
+    }
+
+    /**
+     * Runs a callback that arrived from outside Phaser. A stale scene bows out,
+     * and a throw is swallowed rather than aborting the emit, which would stop
+     * every listener queued behind this one from ever seeing the event.
+     */
+    private guarded (fn: () => void): void
+    {
+        if (!this.attached) return;
+
+        try
+        {
+            fn();
+        }
+        catch (err)
+        {
+            console.error('[net] handler failed', err);
+        }
+    }
+
+    private syncNetMode (): void
+    {
+        if (this.netResync || !this.attached) return;
+
+        const live = net.online ? net.role : null;
+
+        if (live === this.netRole) return;
+
+        this.netResync = true;
+
+        if (live === 'guest')
+        {
+            // The host's cue is on its way. Rebuild alone if it never lands.
+            this.time.delayedCall(2500, () =>
+            {
+                if (this.attached && net.online && net.role === 'guest' && this.netRole === null)
+                {
+                    this.scene.restart();
+                }
+            });
+
+            return;
+        }
+
+        if (live === 'host')
+        {
+            this.restartMatch();
+            return;
+        }
+
+        // Back to a local match against the AI.
+        this.scene.restart();
+    }
+
     /** Host-only broadcast. Called from code both sides run, so it must check. */
     private netEvent (message: NetMessage): void
     {
-        if (this.netRole !== 'host') return;
+        if (net.role !== 'host') return;
 
         net.send(message);
     }
@@ -2545,7 +2631,7 @@ export class Game extends Scene
                 break;
 
             case 'rq':
-                if (this.netRole === 'host') this.restartMatch();
+                if (net.role === 'host') this.restartMatch();
                 break;
 
             // ---- host to guest ----
@@ -2623,7 +2709,9 @@ export class Game extends Scene
                 break;
 
             case 'rs':
-                if (this.netRole === 'guest') this.scene.restart();
+                // Sent before the guest's scene knows it is a guest, so this
+                // goes by the live connection rather than the scene's copy.
+                if (net.role === 'guest') this.scene.restart();
                 break;
         }
     }

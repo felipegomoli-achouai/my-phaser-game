@@ -26,9 +26,16 @@ function App()
     const [netState, setNetState] = useState<NetState>(OFFLINE);
     const [codeInput, setCodeInput] = useState('');
 
-    // The scene reads net.role in create(), so the match has to be rebuilt the
-    // moment a connection comes up or goes down.
     const wasOnline = useRef(false);
+
+    // Phaser listens on the window, so typing a room code would otherwise
+    // drive the top around and trip the R / M shortcuts.
+    const setGameKeys = (enabled: boolean) =>
+    {
+        const keyboard = phaserRef.current?.game?.input.keyboard;
+
+        if (keyboard) keyboard.enabled = enabled;
+    };
 
     useEffect(() =>
     {
@@ -47,9 +54,11 @@ function App()
 
                 // Online and offline are different opponents, so the running
                 // tally starts over rather than carrying the AI's rounds in.
+                // Rebuilding the match is the scene's own job: the host does it
+                // and tells the guest, so the two countdowns start together.
                 phaserRef.current?.game?.registry.set('score', { win: 0, loss: 0 });
                 setResult(null);
-                phaserRef.current?.scene?.scene.restart();
+                setGameKeys(true);
             }
         };
 
@@ -88,6 +97,12 @@ function App()
     const joinRoom = () =>
     {
         sfx.unlock();
+
+        // Hand the keyboard back to the game: joining with Enter would
+        // otherwise leave the focus in the field and the top unable to move.
+        (document.activeElement as HTMLElement | null)?.blur?.();
+        setGameKeys(true);
+
         net.join(codeInput).catch(() => undefined);
     };
 
@@ -99,15 +114,6 @@ function App()
     const copyCode = () =>
     {
         navigator.clipboard?.writeText(netState.code).catch(() => undefined);
-    };
-
-    // Phaser listens on the window, so typing a room code would otherwise
-    // drive the top around and trip the R / M shortcuts.
-    const setGameKeys = (enabled: boolean) =>
-    {
-        const keyboard = phaserRef.current?.game?.input.keyboard;
-
-        if (keyboard) keyboard.enabled = enabled;
     };
 
     const busy = netState.status === 'starting' || netState.status === 'connecting';
