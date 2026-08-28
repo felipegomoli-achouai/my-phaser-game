@@ -45,6 +45,24 @@ export class Bey
     public dashCooldown = 0;
     public hitFlash = 0;
 
+    /** Special attack meter, 0..100. Full = special ready. */
+    public meter = 0;
+    /** Seconds left of the special dash. While > 0 the bey is a wrecking ball. */
+    public special = 0;
+    /** Cinematic freeze: keeps rendering, stops all movement and spin drain. */
+    public frozen = false;
+    /** Extra visual spin multiplier used while charging / dashing. */
+    public spinBoost = 0;
+    /** Visual rattle, in pixels. */
+    public shakeAmp = 0;
+
+    /** True while the tip is locked into a stadium rail. The scene drives it. */
+    public onRail = false;
+    /** Seconds left of the rail-launch power window. */
+    public boost = 0;
+    /** Stops the rail from grabbing the same top again immediately. */
+    public railCooldown = 0;
+
     private container: GameObjects.Container;
     private disc: GameObjects.Image;
     private shadow: GameObjects.Image;
@@ -59,7 +77,7 @@ export class Bey
 
         this.radius = config.radius ?? 26;
         this.mass = config.mass ?? 1;
-        this.maxSpin = config.maxSpin ?? 100;
+        this.maxSpin = config.maxSpin ?? 130;
         this.spin = this.maxSpin;
         this.accel = config.accel ?? 950;
         this.maxSpeed = config.maxSpeed ?? 520;
@@ -87,7 +105,8 @@ export class Bey
     /** Steering input. Direction does not need to be normalized. */
     steer (dirX: number, dirY: number, dt: number): void
     {
-        if (!this.alive) return;
+        // No steering while the rail owns the tip.
+        if (!this.alive || this.onRail) return;
 
         const len = Math.hypot(dirX, dirY);
         if (len < 0.001) return;
@@ -127,23 +146,72 @@ export class Bey
         }
     }
 
+    /** Feeds the special meter. Returns true when it just filled up. */
+    gainMeter (amount: number): boolean
+    {
+        if (this.meter >= 100) return false;
+
+        this.meter = Math.min(100, this.meter + amount);
+
+        return this.meter >= 100;
+    }
+
+    get specialReady (): boolean
+    {
+        return this.alive && this.meter >= 100 && this.special <= 0;
+    }
+
+    /** Fires the special: meter is spent and the bey is launched at a target. */
+    launchSpecial (dirX: number, dirY: number, speed: number, duration: number): void
+    {
+        const len = Math.hypot(dirX, dirY) || 1;
+
+        this.meter = 0;
+        this.special = duration;
+        this.vel.set((dirX / len) * speed, (dirY / len) * speed);
+    }
+
     update (dt: number): void
     {
         this.dashCooldown = Math.max(0, this.dashCooldown - dt);
         this.hitFlash = Math.max(0, this.hitFlash - dt * 3);
 
+        if (this.frozen)
+        {
+            this.render(dt);
+            return;
+        }
+
+        this.special = Math.max(0, this.special - dt);
+        this.boost = Math.max(0, this.boost - dt);
+        this.railCooldown = Math.max(0, this.railCooldown - dt);
+
+        // On a rail the scene sets position and velocity directly: no drag, no
+        // wobble, no steering. Spin still burns, a little slower.
+        if (this.onRail)
+        {
+            this.spin = Math.max(0, this.spin - 1.2 * dt);
+            if (this.spin <= 0) this.alive = false;
+            this.render(dt);
+            return;
+        }
+
         if (this.alive)
         {
-            const drag = 1.5;
+            const dashing = this.special > 0;
+
+            // The special dash barely slows down and ignores the normal cap.
+            const drag = dashing ? 0.3 : 0.95;
             this.vel.scale(Math.max(0, 1 - drag * dt));
 
-            if (this.speed > this.maxSpeed)
+            const cap = dashing ? this.maxSpeed * 3.2 : this.maxSpeed;
+            if (this.speed > cap)
             {
-                this.vel.setLength(this.maxSpeed);
+                this.vel.setLength(cap);
             }
 
             // Spin drains over time, faster while moving hard.
-            const burn = 1.6 + this.speed * 0.0045;
+            const burn = (1.5 + this.speed * 0.0026) * (dashing ? 0.35 : 1);
             this.spin = Math.max(0, this.spin - burn * dt);
 
             if (this.spin <= 0)
@@ -152,7 +220,7 @@ export class Bey
             }
 
             // Low spin: drunken wobble that drags the bey off course.
-            if (this.spinRatio < 0.3)
+            if (this.spinRatio < 0.3 && !dashing)
             {
                 const wobble = (0.3 - this.spinRatio) / 0.3;
                 this.wobblePhase += dt * 9;
@@ -173,23 +241,25 @@ export class Bey
 
     private render (dt: number): void
     {
-        // Visual spin rate follows remaining stamina.
-        const rate = this.alive ? (0.25 + this.spinRatio) * 22 : 3;
+        // Visual spin rate follows remaining stamina, boosted while charging.
+        const rate = this.alive ? (0.25 + this.spinRatio) * 22 * (1 + this.spinBoost) : 3;
         this.discAngle += this.spinDir * rate * dt;
         this.disc.setRotation(this.discAngle);
 
         const wobbleAmp = this.alive ? (1 - this.spinRatio) * 4 : 10;
         this.wobblePhase += dt * (this.alive ? 12 : 5);
 
+        const rattle = this.shakeAmp;
+
         this.container.setPosition(this.pos.x, this.pos.y);
         this.disc.setPosition(
-            Math.cos(this.wobblePhase) * wobbleAmp,
-            Math.sin(this.wobblePhase * 1.3) * wobbleAmp * 0.6
+            Math.cos(this.wobblePhase) * wobbleAmp + PMath.FloatBetween(-rattle, rattle),
+            Math.sin(this.wobblePhase * 1.3) * wobbleAmp * 0.6 + PMath.FloatBetween(-rattle, rattle)
         );
 
         if (this.alive)
         {
-            this.disc.setScale(1 + this.hitFlash * 0.25);
+            this.disc.setScale(1 + this.hitFlash * 0.25 + Math.min(0.35, this.spinBoost * 0.03));
         }
         else
         {
@@ -200,6 +270,23 @@ export class Bey
         }
 
         this.shadow.setPosition(this.disc.x * 0.4, 7 + this.disc.y * 0.4);
+    }
+
+    /** Hides the top once it has been replaced by flying debris. */
+    hide (): void
+    {
+        this.container.setVisible(false);
+    }
+
+    setDepth (depth: number): void
+    {
+        this.container.setDepth(depth);
+    }
+
+    /** Texture key of this bey's disc, for after-images and effects. */
+    get textureKey (): string
+    {
+        return `bey-${this.name}`;
     }
 
     destroy (): void
@@ -249,6 +336,32 @@ export class Bey
 
         g.generateTexture(`bey-${name}`, size, size);
         g.clear();
+
+        // Debris used by the shatter animation: jagged chunks of the disc.
+        for (let v = 0; v < 4; v++)
+        {
+            const w = 24;
+            const h = 20;
+
+            g.fillStyle(color, 1);
+            g.beginPath();
+            g.moveTo(1, 3 + v);
+            g.lineTo(w - 2, 1 + v * 2);
+            g.lineTo(w - 5 - v * 2, h - 1);
+            g.closePath();
+            g.fillPath();
+
+            g.fillStyle(accent, 1);
+            g.beginPath();
+            g.moveTo(1, 3 + v);
+            g.lineTo(w - 5 - v * 2, h - 1);
+            g.lineTo(2 + v, h - 4);
+            g.closePath();
+            g.fillPath();
+
+            g.generateTexture(`shard-${name}-${v}`, w, h);
+            g.clear();
+        }
 
         if (!scene.textures.exists('bey-shadow'))
         {
