@@ -45,6 +45,14 @@ export class Sfx
     private roarVoice: { nodes: AudioScheduledSourceNode[]; gain: GainNode } | null = null;
     /** Revving grind while two tops are locked together in a finisher. */
     private clashVoice: { nodes: AudioScheduledSourceNode[]; gain: GainNode } | null = null;
+    /** Sustained scream while two specials are locked in a duel. */
+    private duelVoice: {
+        nodes: AudioScheduledSourceNode[];
+        gain: GainNode;
+        scream: BiquadFilterNode;
+        engine: OscillatorNode;
+        press: GainNode;
+    } | null = null;
 
     get isMuted (): boolean
     {
@@ -1105,6 +1113,188 @@ export class Sfx
         this.clashVoice = null;
     }
 
+    /**
+     * Two specials meeting head on and refusing to give: a sustained scream of
+     * metal, an engine held at the limiter and a sub that never lets up. Runs
+     * until stopped; `setDuelIntensity` tightens it as the duel goes on.
+     */
+    duelGrind (): void
+    {
+        const ctx = this.ensure();
+        if (!ctx || !this.master || !this.noise) return;
+
+        this.stopDuelGrind();
+
+        const t0 = this.now();
+
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(0.42, t0 + 0.12);
+        gain.connect(this.master);
+
+        const drive = this.shaper(12);
+        drive.connect(gain);
+
+        // Pressure: rises every time someone lands a hit.
+        const press = ctx.createGain();
+        press.gain.value = 1;
+        press.connect(drive);
+
+        const nodes: AudioScheduledSourceNode[] = [];
+
+        // Screaming contact between the two rims.
+        const screamSrc = ctx.createBufferSource();
+        screamSrc.buffer = this.noise;
+        screamSrc.loop = true;
+
+        const scream = ctx.createBiquadFilter();
+        scream.type = 'bandpass';
+        scream.frequency.value = 2200;
+        scream.Q.value = 9;
+
+        const screamGain = ctx.createGain();
+        screamGain.gain.value = 0.9;
+
+        screamSrc.connect(scream).connect(screamGain).connect(press);
+        screamSrc.start(t0);
+        nodes.push(screamSrc);
+
+        // Engine held wide open under it.
+        const engine = ctx.createOscillator();
+        engine.type = 'sawtooth';
+        engine.frequency.value = 320;
+
+        const engineGain = ctx.createGain();
+        engineGain.gain.value = 0.35;
+
+        engine.connect(engineGain).connect(press);
+        engine.start(t0);
+        nodes.push(engine);
+
+        // Sub bed.
+        const rumble = ctx.createBufferSource();
+        rumble.buffer = this.noise;
+        rumble.loop = true;
+        rumble.playbackRate.value = 0.28;
+
+        const rumbleFilter = ctx.createBiquadFilter();
+        rumbleFilter.type = 'lowpass';
+        rumbleFilter.frequency.value = 90;
+
+        const rumbleGain = ctx.createGain();
+        rumbleGain.gain.value = 1.6;
+
+        rumble.connect(rumbleFilter).connect(rumbleGain).connect(gain);
+        rumble.start(t0);
+        nodes.push(rumble);
+
+        this.duelVoice = { nodes, gain, scream, engine, press };
+    }
+
+    /** 0..1: how far along the duel is. Everything tightens as it climbs. */
+    setDuelIntensity (value: number): void
+    {
+        if (!this.duelVoice || !this.ctx) return;
+
+        const t = this.ctx.currentTime;
+        const v = Math.min(1, Math.max(0, value));
+
+        this.duelVoice.scream.frequency.setTargetAtTime(1800 + 2600 * v, t, 0.08);
+        this.duelVoice.engine.frequency.setTargetAtTime(260 + 320 * v, t, 0.08);
+        this.duelVoice.gain.gain.setTargetAtTime(0.4 + 0.25 * v, t, 0.1);
+    }
+
+    /** A flick of extra pressure, used on every landed press. */
+    duelSurge (): void
+    {
+        if (!this.duelVoice || !this.ctx) return;
+
+        const t = this.ctx.currentTime;
+        this.duelVoice.press.gain.cancelScheduledValues(t);
+        this.duelVoice.press.gain.setValueAtTime(1.9, t);
+        this.duelVoice.press.gain.setTargetAtTime(1, t + 0.02, 0.09);
+    }
+
+    stopDuelGrind (): void
+    {
+        if (!this.duelVoice || !this.ctx) return;
+
+        const t = this.ctx.currentTime;
+        this.duelVoice.gain.gain.cancelScheduledValues(t);
+        this.duelVoice.gain.gain.setTargetAtTime(0.0001, t, 0.03);
+
+        for (const node of this.duelVoice.nodes)
+        {
+            node.stop(t + 0.2);
+        }
+
+        this.duelVoice = null;
+    }
+
+    /** The two specials meeting: one enormous strike. */
+    duelStart (): void
+    {
+        this.stopCharge();
+        this.stopRoar();
+
+        this.burst({ duration: 0.05, volume: 1.1, type: 'highpass', freqFrom: 4200, freqTo: 9000, q: 0.5, attack: 0.0004, drive: 16 });
+        this.burst({ duration: 0.7, volume: 0.9, type: 'lowpass', freqFrom: 9000, freqTo: 140, q: 0.5, attack: 0.001, drive: 12 });
+        this.tone({ freq: 150, freqTo: 32, duration: 0.8, volume: 0.8, type: 'sine', drive: 8 });
+        this.tone({ freq: 900, freqTo: 300, duration: 0.35, volume: 0.3, type: 'sawtooth', drive: 6 });
+    }
+
+    /**
+     * One shove inside the duel. `index` climbs with the tally, so the strikes
+     * get higher and more frantic as someone pulls ahead.
+     */
+    duelHit (index: number): void
+    {
+        const k = Math.min(1, index / 10);
+
+        this.burst({
+            duration: 0.03,
+            volume: 0.55 + 0.35 * k,
+            type: 'bandpass',
+            freqFrom: 2600 + 3200 * k,
+            freqTo: 1500,
+            q: 1.1,
+            attack: 0.0004,
+            drive: 14
+        });
+
+        this.tone({
+            freq: 420 + 380 * k,
+            freqTo: 150,
+            duration: 0.12,
+            volume: 0.4,
+            type: 'triangle',
+            drive: 8
+        });
+
+        this.tone({
+            freq: 1500 + 900 * k,
+            freqTo: 1100,
+            duration: 0.09,
+            volume: 0.22,
+            type: 'sine',
+            delay: 0.006
+        });
+
+        this.duelSurge();
+    }
+
+    /** The lock breaks and the loser is thrown across the stadium. */
+    duelBreak (): void
+    {
+        this.stopDuelGrind();
+
+        this.burst({ duration: 0.06, volume: 1.2, type: 'highpass', freqFrom: 3800, freqTo: 9000, q: 0.5, attack: 0.0004, drive: 18 });
+        this.burst({ duration: 0.85, volume: 1, type: 'lowpass', freqFrom: 9000, freqTo: 120, q: 0.5, attack: 0.001, drive: 14 });
+        this.tone({ freq: 140, freqTo: 30, duration: 0.9, volume: 0.85, type: 'sine', drive: 8 });
+        // The loser screaming away across the floor.
+        this.burst({ duration: 0.5, volume: 0.45, type: 'bandpass', freqFrom: 2600, freqTo: 400, q: 1.2, delay: 0.05, drive: 8 });
+    }
+
     /** The moment the loser lets go: blast first, then the top comes apart. */
     clashBreak (): void
     {
@@ -1213,6 +1403,7 @@ export class Sfx
         this.stopCharge();
         this.stopRoar();
         this.stopClashRev();
+        this.stopDuelGrind();
         this.stopDrone();
     }
 }

@@ -57,6 +57,8 @@ function App()
                     <li><b>WASD / setas</b> — mover</li>
                     <li><b>Espaço</b> — investida (gasta giro)</li>
                     <li><b>Shift</b> — especial (barra amarela cheia)</li>
+                    <li><b>Shift</b> durante o especial do oponente — revida e abre o duelo</li>
+                    <li><b>Espaço</b> no duelo — 10 pancadas primeiro vence</li>
                     <li><b>R</b> — reiniciar</li>
                     <li><b>M</b> — mudo</li>
                 </ul>

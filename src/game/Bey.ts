@@ -400,6 +400,20 @@ export class Bey
             g.fillStyle(0xffffff, 1);
             g.fillCircle(6, 6, 5);
             g.generateTexture('spark', 12, 12);
+            g.clear();
+        }
+
+        if (!scene.textures.exists('flame'))
+        {
+            // Soft blob: concentric circles fading out, so the trail particles
+            // read as fire rather than as hard dots.
+            for (let i = 8; i > 0; i--)
+            {
+                g.fillStyle(0xffffff, 0.16);
+                g.fillCircle(16, 16, i * 2);
+            }
+
+            g.generateTexture('flame', 32, 32);
         }
 
         g.destroy();

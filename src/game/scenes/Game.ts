@@ -20,6 +20,20 @@ const RAIL_ACCEL = 3400;
 const RAIL_BOOST_TIME = 0.85;
 const RAIL_BOOST_DAMAGE = 2.3;
 
+/** Movement trail: after-images plus the fire they leave on the floor. */
+const TRAIL_MIN_SPEED = 170;
+
+/** Special vs special: both are spent and it comes down to who mashes faster. */
+const DUEL_TARGET = 10;
+const DUEL_ZOOM = 1.5;
+const DUEL_TIME_LIMIT = 8;
+const DUEL_PUSH = 7;
+const DUEL_LAUNCH_SPEED = 1750;
+const DUEL_TUMBLE_TIME = 1.6;
+const DUEL_DAMAGE = 26;
+/** The window in which the AI decides to answer a special with its own. */
+const DUEL_AI_COUNTER_CHANCE = 0.75;
+
 /** Finisher: the two tops lock together and wind up before one breaks. */
 const CLASH_TIME = 1.9;
 const CLASH_ZOOM = 0.9;
@@ -41,7 +55,7 @@ const RAIL_TUMBLE_TIME = 0.6;
 /** Debug: player starts with the special meter already full. */
 const DEBUG_FULL_METER = true;
 
-type Phase = 'countdown' | 'battle' | 'charging' | 'special' | 'clash' | 'over';
+type Phase = 'countdown' | 'battle' | 'charging' | 'special' | 'duel' | 'clash' | 'over';
 
 /** A straight toothed rail running from the wall to the middle of the floor. */
 interface Rail
@@ -64,6 +78,9 @@ export class Game extends Scene
     private specialText: GameObjects.Text;
     private hintText: GameObjects.Text;
     private sparks: GameObjects.Particles.ParticleEmitter;
+    /** One trail emitter per top, tinted in that top's own colours. */
+    private flames = new Map<Bey, GameObjects.Particles.ParticleEmitter>();
+    private trailTimers = new Map<Bey, number>();
 
     private cursors: Types.Input.Keyboard.CursorKeys;
     private keys: Record<string, Input.Keyboard.Key>;
@@ -90,6 +107,19 @@ export class Game extends Scene
     private railGlow: GameObjects.Graphics;
     private railTrail = 0;
     private aiUseRail = false;
+
+    /** Special-vs-special duel state. */
+    private duelStart = 0;
+    private duelPlayer = 0;
+    private duelEnemy = 0;
+    private duelOffset = 0;
+    private duelAiTimer = 0;
+    private duelShock = 0;
+    /** Recent shoves, for the impact rings drawn over the lock. */
+    private duelHits: { at: number; dir: number }[] = [];
+    private duelCounterRolled = false;
+    private duelText: GameObjects.Text;
+    private duelHint: GameObjects.Text;
 
     /** Finisher state. */
     private clashTimer = 0;
@@ -120,6 +150,7 @@ export class Game extends Scene
         this.rails = this.buildRails();
         this.clashWinner = null;
         this.clashLoser = null;
+        this.duelCounterRolled = false;
 
         sfx.stopAll();
 
@@ -163,6 +194,32 @@ export class Game extends Scene
         });
         this.sparks.setDepth(50);
 
+        // Fire left on the floor by a top under way, in its own colours.
+        this.flames = new Map();
+
+        for (const bey of [this.player, this.enemy])
+        {
+            const emitter = this.add.particles(0, 0, 'flame', {
+                speed: { min: 8, max: 55 },
+                lifespan: { min: 260, max: 540 },
+                scale: { start: 0.7, end: 0 },
+                alpha: { start: 0.75, end: 0 },
+                tint: [
+                    this.shade(bey.color, 0.8),
+                    this.shade(bey.color, 0.35),
+                    bey.color,
+                    this.shade(bey.color, -0.5)
+                ],
+                blendMode: 'ADD',
+                emitting: false
+            });
+
+            emitter.setDepth(8);
+            this.flames.set(bey, emitter);
+        }
+
+        this.trailTimers = new Map();
+
         // Cinematic dimmer: sits above the arena, below the charging bey.
         // Oversized so the zoom-in never reveals its edges.
         this.darkness = this.add.rectangle(ARENA_X, ARENA_Y, 2400, 1800, 0x000000)
@@ -184,8 +241,18 @@ export class Game extends Scene
             stroke: '#000000', strokeThickness: 10, align: 'center'
         }).setOrigin(0.5).setDepth(70).setAlpha(0);
 
+        this.duelText = this.add.text(ARENA_X, ARENA_Y - 96, '', {
+            fontFamily: 'Arial Black', fontSize: 40, color: '#ffffff',
+            stroke: '#000000', strokeThickness: 8, align: 'center'
+        }).setOrigin(0.5).setDepth(103).setAlpha(0);
+
+        this.duelHint = this.add.text(ARENA_X, ARENA_Y + 92, '', {
+            fontFamily: 'Arial Black', fontSize: 22, color: '#ffd166',
+            stroke: '#000000', strokeThickness: 6, align: 'center'
+        }).setOrigin(0.5).setDepth(103).setAlpha(0);
+
         this.hintText = this.add.text(ARENA_X, 740,
-            'WASD: mover   ESPACO: investida   SHIFT: especial   |   trilhos nas laterais aceleram, buracos ao norte e sul eliminam', {
+            'WASD: mover   ESPACO: investida   SHIFT: especial (e revide)   |   trilhos aceleram, buracos ao norte e sul eliminam', {
             fontFamily: 'Arial', fontSize: 18, color: '#9fd8ff'
         }).setOrigin(0.5).setDepth(101);
 
@@ -208,6 +275,7 @@ export class Game extends Scene
         if (DEBUG_FULL_METER)
         {
             this.player.meter = 100;
+            this.enemy.meter = 100;
         }
 
         EventBus.emit('current-scene-ready', this);
@@ -234,6 +302,14 @@ export class Game extends Scene
         {
             this.updateCharge(dt);
             this.drawHud();
+            return;
+        }
+
+        if (this.phase === 'duel')
+        {
+            this.updateDuel(dt);
+            this.player.update(dt);
+            this.enemy.update(dt);
             return;
         }
 
@@ -265,6 +341,7 @@ export class Game extends Scene
         this.player.update(dt);
         this.enemy.update(dt);
 
+        this.updateTrails(dt);
         this.updateRails(dt);
 
         this.collideWithWall(this.player);
@@ -338,6 +415,7 @@ export class Game extends Scene
             if (this.player.dash(ax, ay))
             {
                 this.sparks.emitParticleAt(this.player.pos.x, this.player.pos.y, 6);
+                this.dashPing(this.player);
                 sfx.dash();
             }
         }
@@ -423,6 +501,7 @@ export class Game extends Scene
             if (ai.dash(p.pos.x - ai.pos.x, p.pos.y - ai.pos.y))
             {
                 this.sparks.emitParticleAt(ai.pos.x, ai.pos.y, 6);
+                this.dashPing(ai);
                 sfx.dash();
             }
         }
@@ -435,6 +514,7 @@ export class Game extends Scene
     {
         this.phase = 'charging';
         this.charger = bey;
+        this.duelCounterRolled = false;
         this.chargeTimer = 0;
         this.orbitTimer = 0;
 
@@ -490,6 +570,9 @@ export class Game extends Scene
 
         this.drawChargeAura(bey, t);
         this.spawnChargeParticles(bey, dt, t);
+        this.checkDuelCounter(t);
+
+        if (this.phase !== 'charging') return;
 
         if (t >= 1)
         {
@@ -668,6 +751,9 @@ export class Game extends Scene
 
         this.sparks.emitParticleAt(bey.pos.x, bey.pos.y, 2);
 
+        this.checkDuelCounter(1);
+        if (this.phase !== 'special') return;
+
         // Speed lines streaming back from the bey.
         const g = this.speedLines;
         g.clear();
@@ -698,6 +784,7 @@ export class Game extends Scene
     private endSpecial (): void
     {
         this.speedLines.clear();
+        this.duelHint.setAlpha(0);
 
         if (this.charger)
         {
@@ -1080,6 +1167,438 @@ export class Game extends Scene
         }
     }
 
+    /** Mixes a colour towards white (amount > 0) or black (amount < 0). */
+    private shade (color: number, amount: number): number
+    {
+        const channel = (shift: number) =>
+        {
+            const v = (color >> shift) & 0xff;
+            const mixed = amount >= 0 ? v + (255 - v) * amount : v * (1 + amount);
+
+            return Math.max(0, Math.min(255, Math.round(mixed)));
+        };
+
+        return (channel(16) << 16) | (channel(8) << 8) | channel(0);
+    }
+
+    /**
+     * Short double ping on a dash: a ring snapping outwards, then a smaller,
+     * faster one behind it. Reads as a quick shove without stealing attention.
+     */
+    private dashPing (bey: Bey): void
+    {
+        for (const [delay, radius, width, life] of [[0, 22, 3, 240], [70, 14, 2, 180]] as const)
+        {
+            const ring = this.add.circle(bey.pos.x, bey.pos.y, radius)
+                .setStrokeStyle(width, bey.color, 0.9)
+                .setDepth(14)
+                .setScale(0.45)
+                .setAlpha(0);
+
+            this.tweens.add({
+                targets: ring,
+                scale: 1.5,
+                alpha: { from: 0.85, to: 0 },
+                delay,
+                duration: life,
+                ease: 'Quad.Out',
+                onComplete: () => ring.destroy()
+            });
+        }
+    }
+
+    /**
+     * Movement trail: a fading after-image of the disc plus a lick of fire off
+     * the tip. Both get denser and hotter with speed, and a top that has just
+     * been launched or is riding a rail burns at full heat regardless.
+     */
+    private updateTrails (dt: number): void
+    {
+        for (const bey of [this.player, this.enemy])
+        {
+            const timer = (this.trailTimers.get(bey) ?? 0) - dt;
+
+            // The special dash lays down its own, much heavier, trail.
+            if (!bey.alive || bey.frozen || bey.special > 0 || bey.speed < TRAIL_MIN_SPEED)
+            {
+                this.trailTimers.set(bey, Math.max(0, timer));
+                continue;
+            }
+
+            if (timer > 0)
+            {
+                this.trailTimers.set(bey, timer);
+                continue;
+            }
+
+            const speed = bey.speed;
+            let heat = PMath.Clamp((speed - TRAIL_MIN_SPEED) / 650, 0, 1);
+            if (bey.boost > 0 || bey.tumble > 0 || bey.onRail)
+            {
+                heat = Math.max(heat, 0.85);
+            }
+
+            // Faster top, tighter spacing between after-images.
+            this.trailTimers.set(bey, PMath.Linear(0.08, 0.026, heat));
+
+            const ghost = this.add.image(bey.pos.x, bey.pos.y, bey.textureKey)
+                .setDepth(9)
+                .setAlpha(0.22 + 0.42 * heat)
+                .setRotation(Math.random() * Math.PI);
+
+            this.tweens.add({
+                targets: ghost,
+                alpha: 0,
+                scale: 0.7,
+                duration: 190 + 170 * heat,
+                onComplete: () => ghost.destroy()
+            });
+
+            // Fire drops behind the tip, not on top of it.
+            const nx = bey.vel.x / speed;
+            const ny = bey.vel.y / speed;
+
+            this.flames.get(bey)?.emitParticleAt(
+                bey.pos.x - nx * 10 + PMath.FloatBetween(-4, 4),
+                bey.pos.y - ny * 10 + PMath.FloatBetween(-4, 4),
+                1 + Math.floor(2 * heat)
+            );
+        }
+    }
+
+    // -- special vs special -----------------------------------------------
+
+    /**
+     * While one top is committed to its special, the other can answer with its
+     * own. The player does it with SHIFT; the AI rolls for it once per special.
+     */
+    private checkDuelCounter (t: number): void
+    {
+        const charger = this.charger;
+        if (!charger || !this.player.alive || !this.enemy.alive) return;
+
+        const defender = charger === this.player ? this.enemy : this.player;
+        if (!defender.specialReady) return;
+
+        if (defender === this.player)
+        {
+            this.duelHint.setText('SHIFT: REVIDAR').setAlpha(1);
+
+            if (Input.Keyboard.JustDown(this.keys.SHIFT))
+            {
+                this.startDuel();
+            }
+
+            return;
+        }
+
+        // The AI only gets one chance to read the attack, part way in.
+        if (!this.duelCounterRolled && t > 0.4)
+        {
+            this.duelCounterRolled = true;
+
+            if (Math.random() < DUEL_AI_COUNTER_CHANCE)
+            {
+                this.startDuel();
+            }
+        }
+    }
+
+    /** Both specials are spent at once: the tops meet in the middle. */
+    private startDuel (): void
+    {
+        this.phase = 'duel';
+        this.duelStart = this.time.now;
+        this.duelPlayer = 0;
+        this.duelEnemy = 0;
+        this.duelOffset = 0;
+        this.duelShock = 0;
+        this.duelAiTimer = PMath.FloatBetween(0.25, 0.4);
+        this.duelHits = [];
+        this.duelCounterRolled = true;
+
+        // Everything else stops: both specials are burnt on this.
+        this.endSpecial();
+        this.speedLines.clear();
+        this.specialText.setAlpha(0);
+        this.duelHint.setAlpha(0);
+
+        for (const bey of this.rides.keys())
+        {
+            bey.onRail = false;
+        }
+        this.rides.clear();
+
+        for (const bey of [this.player, this.enemy])
+        {
+            bey.frozen = true;
+            bey.vel.set(0, 0);
+            bey.meter = 0;
+            bey.special = 0;
+            bey.boost = 0;
+            bey.tumble = 0;
+            bey.setDepth(60);
+        }
+
+        // Face to face in the middle of the stadium.
+        const gap = this.player.radius + 2;
+        this.player.pos.set(ARENA_X - gap, ARENA_Y);
+        this.enemy.pos.set(ARENA_X + gap, ARENA_Y);
+
+        this.hud.setVisible(false);
+        this.hintText.setVisible(false);
+
+        this.duelText.setAlpha(1);
+
+        sfx.stopDrone();
+        sfx.duelStart();
+        sfx.duelGrind();
+
+        this.cameras.main.flash(200, 255, 255, 255);
+        this.cameras.main.shake(400, 0.03);
+        this.sparks.emitParticleAt(ARENA_X, ARENA_Y, 60);
+    }
+
+    private updateDuel (dt: number): void
+    {
+        const elapsed = (this.time.now - this.duelStart) / 1000;
+        const lead = this.duelPlayer - this.duelEnemy;
+        const progress = Math.max(this.duelPlayer, this.duelEnemy) / DUEL_TARGET;
+
+        this.duelShock -= dt;
+        this.duelAiTimer -= dt;
+
+        // Player input: every press is a shove.
+        if (Input.Keyboard.JustDown(this.keys.SPACE))
+        {
+            this.duelPlayer++;
+            this.duelPress(this.player, this.enemy, this.duelPlayer);
+        }
+
+        // The AI mashes at a human-ish rate, with a wobble so it is beatable.
+        if (this.duelAiTimer <= 0)
+        {
+            this.duelAiTimer = PMath.FloatBetween(0.17, 0.29);
+            this.duelEnemy++;
+            this.duelPress(this.enemy, this.player, this.duelEnemy);
+        }
+
+        // The contact point slides towards whoever is losing the exchange.
+        const target = PMath.Clamp(lead * DUEL_PUSH, -70, 70);
+        this.duelOffset = PMath.Linear(this.duelOffset, target, Math.min(1, dt * 8));
+
+        const gap = this.player.radius + 2;
+        const jitter = () => PMath.FloatBetween(-2, 2);
+
+        this.player.pos.set(ARENA_X + this.duelOffset - gap + jitter(), ARENA_Y + jitter());
+        this.enemy.pos.set(ARENA_X + this.duelOffset + gap + jitter(), ARENA_Y + jitter());
+
+        for (const bey of [this.player, this.enemy])
+        {
+            bey.spinBoost = 16 + 12 * progress;
+            bey.shakeAmp = 3 + 3 * progress;
+        }
+
+        // Camera locked in tight, stadium blacked out.
+        this.darkness.setAlpha(0.85);
+        this.cameras.main.setZoom(1 + DUEL_ZOOM);
+        this.cameras.main.centerOn(ARENA_X + this.duelOffset * 0.5, ARENA_Y);
+
+        sfx.setDuelIntensity(progress);
+
+        // Constant shower of sparks out of the contact seam.
+        const contactX = ARENA_X + this.duelOffset;
+        this.sparks.emitParticleAt(
+            contactX + PMath.FloatBetween(-5, 5),
+            ARENA_Y + PMath.FloatBetween(-8, 8),
+            3 + Math.floor(5 * progress)
+        );
+
+        if (this.duelShock <= 0)
+        {
+            this.duelShock = 0.12;
+            this.sparks.emitParticleAt(contactX, ARENA_Y, 12);
+            this.cameras.main.shake(160, 0.006 + 0.008 * progress);
+        }
+
+        this.drawDuelAura(contactX, progress);
+
+        this.duelText.setText(`${this.duelPlayer}   -   ${this.duelEnemy}`);
+        this.duelText.setPosition(ARENA_X + this.duelOffset * 0.5, ARENA_Y - 96);
+
+        if (this.duelPlayer >= DUEL_TARGET || this.duelEnemy >= DUEL_TARGET)
+        {
+            const playerWins = this.duelPlayer >= DUEL_TARGET;
+            this.endDuel(playerWins ? this.player : this.enemy, playerWins ? this.enemy : this.player);
+            return;
+        }
+
+        if (elapsed > DUEL_TIME_LIMIT)
+        {
+            // Out of time: whoever was ahead takes it.
+            const playerWins = this.duelPlayer >= this.duelEnemy;
+            this.endDuel(playerWins ? this.player : this.enemy, playerWins ? this.enemy : this.player);
+        }
+    }
+
+    /** One shove: sparks, a knock and a little ground given. */
+    private duelPress (striker: Bey, victim: Bey, count: number): void
+    {
+        sfx.duelHit(count);
+
+        const dir = striker === this.player ? 1 : -1;
+        const contactX = ARENA_X + this.duelOffset;
+
+        // The shove lands instantly, then the lock creeps back: that snap is
+        // what sells each press as a real hit rather than a bar filling up.
+        this.duelOffset += dir * 3.5;
+        this.duelHits.push({ at: this.time.now, dir });
+
+        this.sparks.emitParticleAt(contactX + dir * 6, ARENA_Y, 18);
+        this.sparks.emitParticleAt(contactX + dir * 16, ARENA_Y + PMath.FloatBetween(-10, 10), 8);
+        this.cameras.main.shake(90, 0.011);
+
+        victim.hitFlash = 1;
+        victim.shakeAmp = 9;
+        striker.spinBoost += 6;
+    }
+
+    /** Rings, streaks and a tug bar over the locked pair. */
+    private drawDuelAura (contactX: number, progress: number): void
+    {
+        const g = this.aura;
+        g.clear();
+
+        // Shockwaves thrown off the seam.
+        for (let i = 0; i < 3; i++)
+        {
+            const phase = ((this.time.now / 500) + i / 3) % 1;
+            g.lineStyle(4 - i, 0xffffff, (1 - phase) * 0.6);
+            g.strokeCircle(contactX, ARENA_Y, 20 + phase * 150);
+        }
+
+        // Streaks blasting sideways out of the contact point.
+        g.lineStyle(2, 0xffe066, 0.5 + 0.4 * progress);
+        for (let i = 0; i < 12; i++)
+        {
+            const a = PMath.FloatBetween(0, Math.PI * 2);
+            const r0 = 26 + Math.random() * 20;
+            const r1 = r0 + 30 + Math.random() * 120 * (0.4 + progress);
+            g.lineBetween(
+                contactX + Math.cos(a) * r0,
+                ARENA_Y + Math.sin(a) * r0,
+                contactX + Math.cos(a) * r1,
+                ARENA_Y + Math.sin(a) * r1
+            );
+        }
+
+        // Impact rings from the last few shoves, punched out sideways.
+        this.duelHits = this.duelHits.filter((hit) => this.time.now - hit.at < 380);
+
+        for (const hit of this.duelHits)
+        {
+            const age = (this.time.now - hit.at) / 380;
+            const rr = 10 + age * 120;
+            g.lineStyle(5 * (1 - age), hit.dir > 0 ? 0x2ee6ff : 0xff4d5a, (1 - age) * 0.9);
+            g.strokeCircle(contactX + hit.dir * (14 + age * 40), ARENA_Y, rr);
+        }
+
+        // Tug-of-war bar: how close each side is to breaking the lock.
+        const w = 220;
+        const x = ARENA_X + this.duelOffset * 0.5 - w / 2;
+        const y = ARENA_Y - 60;
+
+        g.fillStyle(0x000000, 0.6);
+        g.fillRect(x - 3, y - 3, w + 6, 20);
+        g.fillStyle(0x2ee6ff, 1);
+        g.fillRect(x, y, (w / 2) * (this.duelPlayer / DUEL_TARGET), 14);
+        g.fillStyle(0xff4d5a, 1);
+        const enemyW = (w / 2) * (this.duelEnemy / DUEL_TARGET);
+        g.fillRect(x + w - enemyW, y, enemyW, 14);
+        g.lineStyle(2, 0xffffff, 0.5);
+        g.strokeRect(x, y, w, 14);
+    }
+
+    /** The lock breaks: the loser is thrown across the stadium, out of control. */
+    private endDuel (winner: Bey, loser: Bey): void
+    {
+        this.phase = 'battle';
+
+        sfx.duelBreak();
+
+        this.aura.clear();
+        this.duelText.setAlpha(0);
+        this.duelHint.setAlpha(0);
+        this.hud.setVisible(true);
+        this.hintText.setVisible(true);
+
+        for (const bey of [this.player, this.enemy])
+        {
+            bey.frozen = false;
+            bey.spinBoost = 0;
+            bey.shakeAmp = 0;
+            bey.setDepth(10);
+            bey.railCooldown = 0.6;
+        }
+
+        // Both start from the middle; the loser leaves it a lot faster.
+        const dir = loser === this.enemy ? 1 : -1;
+        const angle = PMath.FloatBetween(-0.35, 0.35);
+
+        loser.pos.set(ARENA_X + dir * (loser.radius + 4), ARENA_Y);
+        loser.vel.set(
+            Math.cos(angle) * dir * DUEL_LAUNCH_SPEED,
+            Math.sin(angle) * DUEL_LAUNCH_SPEED
+        );
+        loser.tumble = DUEL_TUMBLE_TIME;
+        loser.damage(DUEL_DAMAGE);
+
+        winner.pos.set(ARENA_X - dir * (winner.radius + 4), ARENA_Y);
+        winner.vel.set(-dir * 260, 0);
+
+        this.sparks.emitParticleAt(ARENA_X, ARENA_Y, 60);
+        this.cameras.main.flash(260, 255, 255, 255);
+        this.cameras.main.shake(520, 0.034);
+        this.hitStop = 0.1;
+
+        // Lethal launch: hand straight over to the break cinematic, which runs
+        // its own camera, so no zoom-out tween here.
+        if (!loser.alive)
+        {
+            this.startClash(winner, loser);
+            return;
+        }
+
+        // Back out to the whole stadium.
+        const fromZoom = this.cameras.main.zoom;
+        const fromX = this.cameras.main.midPoint.x;
+        const fromY = this.cameras.main.midPoint.y;
+
+        this.tweens.add({ targets: this.darkness, alpha: 0, duration: 300 });
+        this.tweens.addCounter({
+            from: 0,
+            to: 1,
+            duration: 380,
+            ease: 'Quad.Out',
+            onUpdate: (tween) =>
+            {
+                const k = tween.getValue() ?? 1;
+                this.cameras.main.setZoom(PMath.Linear(fromZoom, 1, k));
+                this.cameras.main.centerOn(
+                    PMath.Linear(fromX, ARENA_X, k),
+                    PMath.Linear(fromY, ARENA_Y, k)
+                );
+            },
+            onComplete: () =>
+            {
+                this.cameras.main.setZoom(1);
+                this.cameras.main.centerOn(ARENA_X, ARENA_Y);
+            }
+        });
+
+        sfx.startDrone();
+    }
+
     // -- finisher ---------------------------------------------------------
 
     /**
@@ -1238,6 +1757,7 @@ export class Game extends Scene
         this.aura.clear();
         this.clashWinner = null;
         this.clashLoser = null;
+        this.duelCounterRolled = false;
 
         winner.frozen = false;
         loser.frozen = false;
