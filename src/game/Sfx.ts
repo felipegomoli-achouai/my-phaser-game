@@ -43,6 +43,8 @@ export class Sfx
     private riser: { nodes: AudioScheduledSourceNode[]; gain: GainNode } | null = null;
     /** Engine roar during the special dash. */
     private roarVoice: { nodes: AudioScheduledSourceNode[]; gain: GainNode } | null = null;
+    /** Revving grind while two tops are locked together in a finisher. */
+    private clashVoice: { nodes: AudioScheduledSourceNode[]; gain: GainNode } | null = null;
 
     get isMuted (): boolean
     {
@@ -985,6 +987,138 @@ export class Sfx
         this.burst({ duration: 0.9, volume: 0.18, type: 'lowpass', freqFrom: 1800, freqTo: 90, q: 0.4, delay: 0.05 });
     }
 
+    /**
+     * Two tops locked together, grinding and winding each other up: a race
+     * bike being revved. The engine note climbs, the firing pulse tightens and
+     * the grind on top gets brighter until the break.
+     */
+    clashRev (duration: number): void
+    {
+        const ctx = this.ensure();
+        if (!ctx || !this.master || !this.noise) return;
+
+        this.stopClashRev();
+
+        const t0 = this.now();
+
+        const gain = ctx.createGain();
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(0.5, t0 + duration * 0.85);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration + 0.1);
+        gain.connect(this.master);
+
+        // Cylinders firing: a pulse train that tightens as the revs climb.
+        const fire = ctx.createGain();
+        fire.gain.value = 0.45;
+
+        const fireRate = ctx.createOscillator();
+        fireRate.type = 'sawtooth';
+        fireRate.frequency.setValueAtTime(26, t0);
+        fireRate.frequency.exponentialRampToValueAtTime(190, t0 + duration);
+
+        const fireDepth = ctx.createGain();
+        fireDepth.gain.value = 0.5;
+        fireRate.connect(this.pulseShaper(0.45)).connect(fireDepth).connect(fire.gain);
+        fireRate.start(t0);
+        fireRate.stop(t0 + duration + 0.15);
+
+        fire.connect(gain);
+
+        const drive = this.shaper(14);
+        drive.connect(fire);
+
+        const nodes: AudioScheduledSourceNode[] = [fireRate];
+
+        // Engine note: two detuned saws climbing the rev range.
+        for (const detune of [0, 11])
+        {
+            const osc = ctx.createOscillator();
+            osc.type = 'sawtooth';
+            osc.detune.value = detune;
+            osc.frequency.setValueAtTime(95, t0);
+            osc.frequency.exponentialRampToValueAtTime(640, t0 + duration);
+
+            const g = ctx.createGain();
+            g.gain.value = 0.5;
+
+            osc.connect(g).connect(drive);
+            osc.start(t0);
+            osc.stop(t0 + duration + 0.15);
+            nodes.push(osc);
+        }
+
+        // Metal grinding where the two rims are welded together.
+        const grind = ctx.createBufferSource();
+        grind.buffer = this.noise;
+        grind.loop = true;
+
+        const grindBand = ctx.createBiquadFilter();
+        grindBand.type = 'bandpass';
+        grindBand.Q.value = 2.2;
+        grindBand.frequency.setValueAtTime(900, t0);
+        grindBand.frequency.exponentialRampToValueAtTime(4200, t0 + duration);
+
+        const grindGain = ctx.createGain();
+        grindGain.gain.setValueAtTime(0.0001, t0);
+        grindGain.gain.exponentialRampToValueAtTime(0.7, t0 + duration);
+
+        grind.connect(grindBand).connect(grindGain).connect(drive);
+        grind.start(t0);
+        grind.stop(t0 + duration + 0.15);
+        nodes.push(grind);
+
+        // Sub rumble building under the whole thing.
+        const rumble = ctx.createBufferSource();
+        rumble.buffer = this.noise;
+        rumble.loop = true;
+        rumble.playbackRate.value = 0.3;
+
+        const rumbleFilter = ctx.createBiquadFilter();
+        rumbleFilter.type = 'lowpass';
+        rumbleFilter.frequency.value = 95;
+
+        const rumbleGain = ctx.createGain();
+        rumbleGain.gain.setValueAtTime(0.0001, t0);
+        rumbleGain.gain.exponentialRampToValueAtTime(2, t0 + duration);
+
+        rumble.connect(rumbleFilter).connect(rumbleGain).connect(gain);
+        rumble.start(t0);
+        rumble.stop(t0 + duration + 0.15);
+        nodes.push(rumble);
+
+        this.clashVoice = { nodes, gain };
+    }
+
+    stopClashRev (): void
+    {
+        if (!this.clashVoice || !this.ctx) return;
+
+        const t = this.ctx.currentTime;
+        this.clashVoice.gain.gain.cancelScheduledValues(t);
+        this.clashVoice.gain.gain.setTargetAtTime(0.0001, t, 0.02);
+
+        for (const node of this.clashVoice.nodes)
+        {
+            node.stop(t + 0.15);
+        }
+
+        this.clashVoice = null;
+    }
+
+    /** The moment the loser lets go: blast first, then the top comes apart. */
+    clashBreak (): void
+    {
+        this.stopClashRev();
+
+        // Blast front.
+        this.burst({ duration: 0.06, volume: 1.5, type: 'highpass', freqFrom: 3500, freqTo: 9000, q: 0.5, attack: 0.0004, drive: 18 });
+        this.burst({ duration: 0.8, volume: 1.1, type: 'lowpass', freqFrom: 8000, freqTo: 120, q: 0.5, attack: 0.001, drive: 14 });
+        this.tone({ freq: 130, freqTo: 28, duration: 0.9, volume: 0.9, type: 'sine', drive: 8 });
+
+        // Then the metal itself letting go.
+        this.shatter();
+    }
+
     /** A top coming apart: metal cracking, then pieces skittering away. */
     shatter (): void
     {
@@ -1078,6 +1212,7 @@ export class Sfx
     {
         this.stopCharge();
         this.stopRoar();
+        this.stopClashRev();
         this.stopDrone();
     }
 }

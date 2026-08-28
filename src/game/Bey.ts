@@ -62,6 +62,8 @@ export class Bey
     public boost = 0;
     /** Stops the rail from grabbing the same top again immediately. */
     public railCooldown = 0;
+    /** Seconds of being flung around with no control after a heavy hit. */
+    public tumble = 0;
 
     private container: GameObjects.Container;
     private disc: GameObjects.Image;
@@ -111,8 +113,9 @@ export class Bey
         const len = Math.hypot(dirX, dirY);
         if (len < 0.001) return;
 
-        // A dying bey can barely steer any more.
-        const control = 0.35 + 0.65 * this.spinRatio;
+        // A dying bey can barely steer any more, and a top that has just been
+        // smashed across the stadium has almost no say at all.
+        const control = (0.35 + 0.65 * this.spinRatio) * (this.tumble > 0 ? 0.15 : 1);
 
         this.vel.x += (dirX / len) * this.accel * control * dt;
         this.vel.y += (dirY / len) * this.accel * control * dt;
@@ -185,6 +188,7 @@ export class Bey
         this.special = Math.max(0, this.special - dt);
         this.boost = Math.max(0, this.boost - dt);
         this.railCooldown = Math.max(0, this.railCooldown - dt);
+        this.tumble = Math.max(0, this.tumble - dt);
 
         // On a rail the scene sets position and velocity directly: no drag, no
         // wobble, no steering. Spin still burns, a little slower.
@@ -199,12 +203,17 @@ export class Bey
         if (this.alive)
         {
             const dashing = this.special > 0;
+            const tumbling = this.tumble > 0;
 
             // The special dash barely slows down and ignores the normal cap.
-            const drag = dashing ? 0.3 : 0.95;
+            // A tumbling top keeps most of the speed it was hit with, which is
+            // what makes it ricochet around the stadium instead of settling.
+            const drag = dashing ? 0.3 : tumbling ? 0.45 : 0.95;
             this.vel.scale(Math.max(0, 1 - drag * dt));
 
-            const cap = dashing ? this.maxSpeed * 3.2 : this.maxSpeed;
+            const cap = dashing
+                ? this.maxSpeed * 3.2
+                : tumbling ? this.maxSpeed * 2.6 : this.maxSpeed;
             if (this.speed > cap)
             {
                 this.vel.setLength(cap);
@@ -217,6 +226,21 @@ export class Bey
             if (this.spin <= 0)
             {
                 this.alive = false;
+            }
+
+            // Knocked senseless: veers around while it recovers.
+            if (tumbling)
+            {
+                this.wobblePhase += dt * 14;
+                this.vel.x += Math.cos(this.wobblePhase * 2.3) * 260 * dt;
+                this.vel.y += Math.sin(this.wobblePhase * 1.7) * 260 * dt;
+                this.shakeAmp = 3;
+                this.spinBoost = 2;
+            }
+            else if (this.special <= 0 && this.boost <= 0)
+            {
+                this.shakeAmp = 0;
+                this.spinBoost = 0;
             }
 
             // Low spin: drunken wobble that drags the bey off course.

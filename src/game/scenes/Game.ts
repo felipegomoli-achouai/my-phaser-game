@@ -20,6 +20,10 @@ const RAIL_ACCEL = 3400;
 const RAIL_BOOST_TIME = 0.85;
 const RAIL_BOOST_DAMAGE = 2.3;
 
+/** Finisher: the two tops lock together and wind up before one breaks. */
+const CLASH_TIME = 1.9;
+const CLASH_ZOOM = 0.9;
+
 /** The mouths have a low lip: only a real shove clears it. */
 const GAP_ESCAPE_SPEED = 320;
 
@@ -28,11 +32,16 @@ const CHARGE_TIME = 1.25;
 const SPECIAL_TIME = 0.85;
 const SPECIAL_SPEED = 1650;
 const SPECIAL_DAMAGE_MULT = 3.2;
+/** A special connecting always hurls the other top, however it was moving. */
+const SPECIAL_LAUNCH_SPEED = 1500;
+const SPECIAL_TUMBLE_TIME = 1.2;
+const RAIL_LAUNCH_SPEED = 950;
+const RAIL_TUMBLE_TIME = 0.6;
 
 /** Debug: player starts with the special meter already full. */
 const DEBUG_FULL_METER = true;
 
-type Phase = 'countdown' | 'battle' | 'charging' | 'special' | 'over';
+type Phase = 'countdown' | 'battle' | 'charging' | 'special' | 'clash' | 'over';
 
 /** A straight toothed rail running from the wall to the middle of the floor. */
 interface Rail
@@ -81,6 +90,16 @@ export class Game extends Scene
     private railGlow: GameObjects.Graphics;
     private railTrail = 0;
     private aiUseRail = false;
+
+    /** Finisher state. */
+    private clashTimer = 0;
+    private clashStart = 0;
+    private clashAngle = 0;
+    private clashRadius = 0;
+    private clashShock = 0;
+    private clashPivot = new PMath.Vector2();
+    private clashWinner: Bey | null = null;
+    private clashLoser: Bey | null = null;
     private lastBeep = 4;
 
     constructor ()
@@ -99,6 +118,8 @@ export class Game extends Scene
         this.shattered = new Set<Bey>();
         this.rides = new Map();
         this.rails = this.buildRails();
+        this.clashWinner = null;
+        this.clashLoser = null;
 
         sfx.stopAll();
 
@@ -212,6 +233,15 @@ export class Game extends Scene
         if (this.phase === 'charging')
         {
             this.updateCharge(dt);
+            this.drawHud();
+            return;
+        }
+
+        if (this.phase === 'clash')
+        {
+            this.updateClash(dt);
+            this.player.update(dt);
+            this.enemy.update(dt);
             this.drawHud();
             return;
         }
@@ -978,6 +1008,28 @@ export class Game extends Scene
         a.gainMeter(dmgB * 1.6);
         b.gainMeter(dmgA * 1.6);
 
+        // A special (or a rail launch) does not negotiate with the physics: the
+        // top that got hit is thrown, hard, in a slightly random direction and
+        // left bouncing around with no control. Without this a hit landed on a
+        // top that was already moving away barely pushed it at all.
+        const striker = a.special > 0 ? a : b.special > 0 ? b : a.boost > 0 ? a : b.boost > 0 ? b : null;
+
+        if (striker)
+        {
+            const victim = striker === a ? b : a;
+            const heavy = striker.special > 0;
+
+            const angle = Math.atan2(victim.pos.y - striker.pos.y, victim.pos.x - striker.pos.x)
+                + PMath.FloatBetween(-0.3, 0.3);
+            const launch = heavy ? SPECIAL_LAUNCH_SPEED : RAIL_LAUNCH_SPEED;
+
+            victim.vel.set(Math.cos(angle) * launch, Math.sin(angle) * launch);
+            victim.tumble = Math.max(victim.tumble, heavy ? SPECIAL_TUMBLE_TIME : RAIL_TUMBLE_TIME);
+
+            // The striker is checked by the impact instead of ploughing on.
+            striker.vel.scale(0.4);
+        }
+
         // Extra knockback for the stronger side, so hits feel decisive.
         const railHit = a.boost > 0 || b.boost > 0;
         const kick = impact * (special ? 0.75 : railHit ? 0.55 : 0.25);
@@ -986,6 +1038,16 @@ export class Game extends Scene
         const sign = winnerIsA ? 1 : -1;
         loser.vel.x += nx * kick * sign;
         loser.vel.y += ny * kick * sign;
+
+        // Only a special finishes with the cinematic: the two lock together and
+        // grind before the loser comes apart. Ordinary and rail kills just end
+        // the round with the loser toppling over.
+        if (special && (this.phase === 'battle' || this.phase === 'special') && (!a.alive || !b.alive))
+        {
+            const winner = a.alive ? a : b;
+            const loser = a.alive ? b : a;
+            this.startClash(winner, loser);
+        }
 
         const hitX = a.pos.x + nx * a.radius;
         const hitY = a.pos.y + ny * a.radius;
@@ -999,10 +1061,8 @@ export class Game extends Scene
             this.cameras.main.flash(120, 255, 255, 255);
             this.hitStop = 0.1;
             this.specialImpactTime = this.time.now;
-
-            // Killed outright by the special: shatter instead of toppling.
-            if (!a.alive) this.shatterBey(a);
-            if (!b.alive) this.shatterBey(b);
+            // A lethal special does not shatter here: the finisher owns the
+            // break, so the top only comes apart at the end of the lock-up.
         }
         else
         {
@@ -1018,6 +1078,224 @@ export class Game extends Scene
                 this.cameras.main.shake(120, 0.006);
             }
         }
+    }
+
+    // -- finisher ---------------------------------------------------------
+
+    /**
+     * Locks the two tops together for the kill. They orbit each other faster
+     * and faster, throwing sparks, while the camera pushes in and the rest of
+     * the stadium goes dark - then the loser lets go in pieces.
+     */
+    private startClash (winner: Bey, loser: Bey): void
+    {
+        this.phase = 'clash';
+        this.clashWinner = winner;
+        this.clashLoser = loser;
+        this.clashTimer = 0;
+        this.clashStart = this.time.now;
+        this.clashShock = 0;
+
+        // Drop everything else that was driving the two tops.
+        this.endSpecial();
+        for (const bey of this.rides.keys())
+        {
+            bey.onRail = false;
+        }
+        this.rides.clear();
+
+        this.clashPivot.set(
+            (winner.pos.x + loser.pos.x) / 2,
+            (winner.pos.y + loser.pos.y) / 2
+        );
+        this.clashRadius = (winner.radius + loser.radius) * 0.5 + 3;
+        this.clashAngle = Math.atan2(
+            loser.pos.y - winner.pos.y,
+            loser.pos.x - winner.pos.x
+        );
+
+        winner.frozen = true;
+        loser.frozen = true;
+        winner.vel.set(0, 0);
+        loser.vel.set(0, 0);
+
+        // Both above the dimmer, so only the two of them stay lit.
+        winner.setDepth(60);
+        loser.setDepth(61);
+
+        this.hud.setVisible(false);
+        this.hintText.setVisible(false);
+
+        sfx.stopDrone();
+        sfx.clashRev(CLASH_TIME);
+    }
+
+    private updateClash (dt: number): void
+    {
+        const winner = this.clashWinner!;
+        const loser = this.clashLoser!;
+
+        this.clashShock -= dt;
+
+        // Wall-clock, not the clamped frame delta: the cinematic is heavy on
+        // particles, and on a slow frame dt lags real time, which stretched the
+        // sequence out for seconds longer than intended.
+        this.clashTimer = (this.time.now - this.clashStart) / 1000;
+
+        const t = PMath.Clamp(this.clashTimer / CLASH_TIME, 0, 1);
+        const ease = t * t;
+
+        // The pair spins around the contact point, faster and faster.
+        this.clashAngle += (8 + 62 * ease) * dt;
+        // Grinding: the two press into each other and skip back out.
+        const grind = Math.sin(this.clashAngle * 3.3) * 2.5 * ease;
+        const r = this.clashRadius * (1 - 0.28 * ease) + grind;
+        const cos = Math.cos(this.clashAngle);
+        const sin = Math.sin(this.clashAngle);
+
+        winner.pos.set(this.clashPivot.x - cos * r, this.clashPivot.y - sin * r);
+        loser.pos.set(this.clashPivot.x + cos * r, this.clashPivot.y + sin * r);
+
+        winner.spinBoost = 18 * ease;
+        loser.spinBoost = 24 * ease;
+        winner.shakeAmp = 1 + 4 * ease;
+        loser.shakeAmp = 1.5 + 7 * ease;
+        loser.hitFlash = 0.35 + 0.4 * Math.abs(Math.sin(this.clashAngle * 2));
+
+        // Everything else in the stadium falls away.
+        this.darkness.setAlpha(0.7 * Math.min(1, t * 1.8));
+
+        this.cameras.main.setZoom(1 + CLASH_ZOOM * ease);
+        this.cameras.main.centerOn(
+            PMath.Linear(ARENA_X, this.clashPivot.x, 0.8 * ease),
+            PMath.Linear(ARENA_Y, this.clashPivot.y, 0.8 * ease)
+        );
+
+        // Sparks pour out of the seam between them.
+        const sparkCount = 3 + Math.floor(7 * ease);
+        this.sparks.emitParticleAt(
+            this.clashPivot.x + PMath.FloatBetween(-6, 6),
+            this.clashPivot.y + PMath.FloatBetween(-6, 6),
+            sparkCount
+        );
+
+        if (this.clashShock <= 0)
+        {
+            this.clashShock = 0.14;
+            this.sparks.emitParticleAt(this.clashPivot.x, this.clashPivot.y, 14);
+            this.cameras.main.shake(200, 0.004 + 0.016 * ease);
+        }
+
+        this.drawClashAura(winner, t);
+
+        if (t >= 1)
+        {
+            this.breakClash();
+        }
+    }
+
+    /** Rings and streaks whipping around the locked pair. */
+    private drawClashAura (winner: Bey, t: number): void
+    {
+        const g = this.aura;
+        g.clear();
+
+        const { x, y } = this.clashPivot;
+
+        // Shockwaves thrown off the seam.
+        for (let i = 0; i < 3; i++)
+        {
+            const phase = (t * 3 + i / 3) % 1;
+            g.lineStyle(4 - i, winner.color, (1 - phase) * 0.8 * t);
+            g.strokeCircle(x, y, 24 + phase * 190);
+        }
+
+        // Streaks dragged around by the rotation.
+        g.lineStyle(2, 0xffffff, 0.35 + 0.45 * t);
+        for (let i = 0; i < 14; i++)
+        {
+            const a = this.clashAngle * 0.6 + (i / 14) * Math.PI * 2;
+            const r0 = 30 + Math.random() * 30 * t;
+            const r1 = r0 + 20 + Math.random() * 90 * t;
+            g.lineBetween(
+                x + Math.cos(a) * r0,
+                y + Math.sin(a) * r0,
+                x + Math.cos(a) * r1,
+                y + Math.sin(a) * r1
+            );
+        }
+
+        // Tight halo that swells right before the break.
+        g.lineStyle(3 + 6 * t, winner.color, 0.25 + 0.35 * t);
+        g.strokeCircle(x, y, 46 + Math.sin(this.clashAngle * 3) * 6 * t);
+    }
+
+    private breakClash (): void
+    {
+        const winner = this.clashWinner!;
+        const loser = this.clashLoser!;
+
+        this.aura.clear();
+        this.clashWinner = null;
+        this.clashLoser = null;
+
+        winner.frozen = false;
+        loser.frozen = false;
+        winner.spinBoost = 0;
+        winner.shakeAmp = 0;
+        winner.setDepth(10);
+        loser.setDepth(10);
+
+        // The winner is thrown clear of the blast.
+        const away = new PMath.Vector2(
+            winner.pos.x - this.clashPivot.x,
+            winner.pos.y - this.clashPivot.y
+        ).normalize();
+        winner.vel.set(away.x * 520, away.y * 520);
+
+        sfx.clashBreak();
+
+        this.hud.setVisible(true);
+        this.hintText.setVisible(true);
+
+        this.shatterBey(loser);
+        if (!winner.alive)
+        {
+            this.shatterBey(winner);
+        }
+
+        this.cameras.main.flash(240, 255, 255, 255);
+        this.cameras.main.shake(520, 0.032);
+        this.hitStop = 0.12;
+
+        // Snap back out to the whole stadium.
+        const fromZoom = this.cameras.main.zoom;
+        const fromX = this.cameras.main.midPoint.x;
+        const fromY = this.cameras.main.midPoint.y;
+
+        this.tweens.add({ targets: this.darkness, alpha: 0, duration: 320 });
+        this.tweens.addCounter({
+            from: 0,
+            to: 1,
+            duration: 420,
+            ease: 'Quad.Out',
+            onUpdate: (tween) =>
+            {
+                const k = tween.getValue() ?? 1;
+                this.cameras.main.setZoom(PMath.Linear(fromZoom, 1, k));
+                this.cameras.main.centerOn(
+                    PMath.Linear(fromX, ARENA_X, k),
+                    PMath.Linear(fromY, ARENA_Y, k)
+                );
+            },
+            onComplete: () =>
+            {
+                this.cameras.main.setZoom(1);
+                this.cameras.main.centerOn(ARENA_X, ARENA_Y);
+            }
+        });
+
+        this.finish();
     }
 
     /** Blows a defeated bey into pieces that skid across the arena and fade. */
@@ -1324,11 +1602,8 @@ export class Game extends Scene
         this.endSpecial();
         this.player.frozen = false;
         this.enemy.frozen = false;
-        this.darkness.setAlpha(0);
         this.specialText.setAlpha(0);
         this.aura.clear();
-        this.cameras.main.setZoom(1);
-        this.cameras.main.centerOn(ARENA_X, ARENA_Y);
 
         const playerLost = !this.player.alive;
         const enemyLost = !this.enemy.alive;
